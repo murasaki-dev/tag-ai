@@ -13,6 +13,9 @@ A robust, local-first Python desktop application built with **CustomTkinter** fo
 - **Safety & Watchdog Controls:** Includes multi-tier rate limiters, a 60-second watchdog timer, and an instant **"Skip Current File"** button to prevent hanging on unresponsive requests.
 - **Interactive History Dashboard:** View thumbnails, inspect source vs. matched artwork, open files externally, view folders, or undo recent moves.
 
+<img width="1438" height="2142" alt="python_YZyjqwzUwT" src="https://github.com/user-attachments/assets/957c36f4-38bd-45d6-9c75-b002b2c99b7f" /><img width="1438" height="2142" alt="python_9bO68ImDid" src="https://github.com/user-attachments/assets/3bc36d9a-2e16-41af-b24c-baf4377affeb" />
+
+
 ---
 
 ## Prerequisites & Dependencies
