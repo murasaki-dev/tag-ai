@@ -263,142 +263,151 @@ def extract_embedded_tags(file_path):
     return tag_text.strip()
 
 
-def fetch_google_lens_context(file_path, api_key, log_callback=None):
-    upload_path = file_path
-    temp_compressed_path = None
-    try:
-        if os.path.getsize(file_path) > 500 * 1024:
-            if log_callback: log_callback("  [SerpApi] Image size exceeds 500KB limit. Optimizing/compressing for upload...", full_only=True)
-            with Image.open(file_path) as img:
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                temp_compressed_path = file_path + "_serpapi_temp.jpg"
-                
-                quality = 90
-                while quality >= 20:
-                    img.save(temp_compressed_path, "JPEG", quality=quality)
-                    if os.path.getsize(temp_compressed_path) <= 500 * 1024:
-                        break
-                    quality -= 15
-            upload_path = temp_compressed_path
+def fetch_google_lens_context(file_path, api_keys, log_callback=None):
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    
+    for key_idx, api_key in enumerate(api_keys):
+        if not api_key.strip():
+            continue
+        upload_path = file_path
+        temp_compressed_path = None
+        try:
+            if os.path.getsize(file_path) > 500 * 1024:
+                if log_callback: log_callback(f"  [SerpApi #{key_idx+1}] Image size exceeds 500KB limit. Optimizing/compressing...", full_only=True)
+                with Image.open(file_path) as img:
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    temp_compressed_path = file_path + f"_serpapi_temp_{key_idx}.jpg"
+                    
+                    quality = 90
+                    while quality >= 20:
+                        img.save(temp_compressed_path, "JPEG", quality=quality)
+                        if os.path.getsize(temp_compressed_path) <= 500 * 1024:
+                            break
+                        quality -= 15
+                upload_path = temp_compressed_path
 
-        if log_callback: log_callback("  [SerpApi] Uploading image to SerpApi Image API...", full_only=True)
-        
-        upload_url = "https://serpapi.com/image"
-        with open(upload_path, "rb") as img_file:
-            upload_response = requests.post(
-                upload_url,
-                data={"api_key": api_key},
-                files={"image": img_file},
-                timeout=15
-            )
+            if log_callback: log_callback(f"  [SerpApi #{key_idx+1}] Uploading image to SerpApi Image API...", full_only=True)
             
-        if upload_response.status_code != 200:
-            if log_callback: log_callback(f"  [SerpApi Error] Upload failed (HTTP {upload_response.status_code}): {upload_response.text[:100]}", full_only=False)
-            return ""
-            
-        upload_data = upload_response.json()
-        image_id = upload_data.get("image_id")
-        if not image_id:
-            if log_callback: log_callback(f"  [SerpApi Warning] No image_id returned: {upload_data}", full_only=False)
-            return ""
-            
-        if log_callback: log_callback("  [SerpApi] Querying Google Lens web index using image_id...", full_only=True)
-        
-        search_url = "https://serpapi.com/search"
-        params = {
-            "engine": "google_lens",
-            "api_key": api_key,
-            "image_id": image_id,
-            "hl": "en"
-        }
-        
-        response = requests.get(search_url, params=params, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            snippets = []
-            
-            kg = data.get("knowledge_graph", [])
-            if kg and isinstance(kg, list):
-                for item in kg:
-                    title = item.get("title", "")
-                    subtitle = item.get("subtitle", "")
-                    if title: snippets.append(f"Entity: {title} ({subtitle})")
-
-            for key in ["visual_matches", "images_results", "inline_images"]:
-                matches = data.get(key, [])
-                if matches and isinstance(matches, list):
-                    for match in matches[:6]:
-                        m_title = match.get("title", "")
-                        m_source = match.get("source", "")
-                        m_link = match.get("link", "")
-                        if m_title: 
-                            snippets.append(f"Match: {m_title} (Source: {m_source}, Link: {m_link})")
+            upload_url = "https://serpapi.com/image"
+            with open(upload_path, "rb") as img_file:
+                upload_response = requests.post(
+                    upload_url,
+                    data={"api_key": api_key.strip()},
+                    files={"image": img_file},
+                    timeout=15
+                )
                 
-            if snippets:
-                context_text = "\n".join(snippets)
-                if log_callback: log_callback(f"  [SerpApi SUCCESS] Found {len(snippets)} search context references!", full_only=True)
-                return context_text
+            if upload_response.status_code != 200:
+                if log_callback: log_callback(f"  [SerpApi #{key_idx+1} Error] Upload failed (HTTP {upload_response.status_code}): {upload_response.text[:100]}", full_only=False)
+                continue
+                
+            upload_data = upload_response.json()
+            image_id = upload_data.get("image_id")
+            if not image_id:
+                if log_callback: log_callback(f"  [SerpApi #{key_idx+1} Warning] No image_id returned: {upload_data}", full_only=False)
+                continue
+                
+            if log_callback: log_callback(f"  [SerpApi #{key_idx+1}] Querying Google Lens web index using image_id...", full_only=True)
+            
+            search_url = "https://serpapi.com/search"
+            params = {
+                "engine": "google_lens",
+                "api_key": api_key.strip(),
+                "image_id": image_id,
+                "hl": "en"
+            }
+            
+            response = requests.get(search_url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                snippets = []
+                
+                kg = data.get("knowledge_graph", [])
+                if kg and isinstance(kg, list):
+                    for item in kg:
+                        title = item.get("title", "")
+                        subtitle = item.get("subtitle", "")
+                        if title: snippets.append(f"Entity: {title} ({subtitle})")
+
+                for key in ["visual_matches", "images_results", "inline_images"]:
+                    matches = data.get(key, [])
+                    if matches and isinstance(matches, list):
+                        for match in matches[:6]:
+                            m_title = match.get("title", "")
+                            m_source = match.get("source", "")
+                            m_link = match.get("link", "")
+                            if m_title: 
+                                snippets.append(f"Match: {m_title} (Source: {m_source}, Link: {m_link})")
+                    
+                if snippets:
+                    context_text = "\n".join(snippets)
+                    if log_callback: log_callback(f"  [SerpApi #{key_idx+1} SUCCESS] Found {len(snippets)} search context references!", full_only=True)
+                    tracker.serpapi_calls += 1
+                    return context_text
             else:
-                if log_callback: log_callback("  [SerpApi Warning] Search completed successfully, but returned empty match lists in JSON structure.", full_only=False)
-        else:
-            if log_callback: log_callback(f"  [SerpApi Error] Search failed (HTTP {response.status_code}): {response.text[:100]}", full_only=False)
-    except Exception as e:
-        if log_callback: log_callback(f"  [SerpApi Error] {e}", full_only=False)
-    finally:
-        if temp_compressed_path and os.path.exists(temp_compressed_path):
-            try: os.remove(temp_compressed_path)
-            except: pass
+                if log_callback: log_callback(f"  [SerpApi #{key_idx+1} Error] Search failed (HTTP {response.status_code})", full_only=False)
+        except Exception as e:
+            if log_callback: log_callback(f"  [SerpApi #{key_idx+1} Error] {e}", full_only=False)
+        finally:
+            if temp_compressed_path and os.path.exists(temp_compressed_path):
+                try: os.remove(temp_compressed_path)
+                except: pass
     return ""
 
 
-def fetch_google_vision_web_detection(file_path, api_key, log_callback=None):
-    if not api_key:
-        return ""
-    
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-    try:
-        if log_callback: log_callback("  [Google Vision] Querying Google Cloud Vision Web Detection API...", full_only=True)
-        with open(file_path, "rb") as image_file:
-            encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
-            
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": encoded_image},
-                    "features": [{"type": "WEB_DETECTION", "maxResults": 10}]
-                }
-            ]
-        }
+def fetch_google_vision_web_detection(file_path, api_keys, log_callback=None):
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
         
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            responses = data.get("responses", [])
-            if not responses:
-                return ""
-            
-            web_det = responses[0].get("webDetection", {})
-            snippets = []
-            
-            best_guess = web_det.get("bestGuessLabels", [])
-            if best_guess:
-                snippets.append(f"Best Guess: {best_guess[0].get('label')}")
+    for key_idx, api_key in enumerate(api_keys):
+        if not api_key.strip():
+            continue
+        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key.strip()}"
+        try:
+            if log_callback: log_callback(f"  [Google Vision #{key_idx+1}] Querying Google Cloud Vision Web Detection API...", full_only=True)
+            with open(file_path, "rb") as image_file:
+                encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
                 
-            for entity in web_det.get("webEntities", [])[:5]:
-                desc = entity.get("description")
-                if desc:
-                    snippets.append(f"Entity: {desc}")
+            payload = {
+                "requests": [
+                    {
+                        "image": {"content": encoded_image},
+                        "features": [{"type": "WEB_DETECTION", "maxResults": 10}]
+                    }
+                ]
+            }
+            
+            response = requests.post(url, json=payload, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                responses = data.get("responses", [])
+                if not responses:
+                    continue
+                
+                web_det = responses[0].get("webDetection", {})
+                snippets = []
+                
+                best_guess = web_det.get("bestGuessLabels", [])
+                if best_guess:
+                    snippets.append(f"Best Guess: {best_guess[0].get('label')}")
                     
-            if snippets:
-                context_text = "\n".join(snippets)
-                if log_callback: log_callback(f"  [Google Vision SUCCESS] Found {len(snippets)} search context references!", full_only=True)
-                return context_text
-        else:
-            if log_callback: log_callback(f"  [Google Vision Error] HTTP {response.status_code}: {response.text[:100]}", full_only=False)
-    except Exception as e:
-        if log_callback: log_callback(f"  [Google Vision Error] {e}", full_only=False)
+                for entity in web_det.get("webEntities", [])[:5]:
+                    desc = entity.get("description")
+                    if desc:
+                        snippets.append(f"Entity: {desc}")
+                        
+                if snippets:
+                    context_text = "\n".join(snippets)
+                    if log_callback: log_callback(f"  [Google Vision #{key_idx+1} SUCCESS] Found {len(snippets)} search context references!", full_only=True)
+                    tracker.gvision_calls += 1
+                    return context_text
+            else:
+                if log_callback: log_callback(f"  [Google Vision #{key_idx+1} Error] HTTP {response.status_code}", full_only=False)
+        except Exception as e:
+            if log_callback: log_callback(f"  [Google Vision #{key_idx+1} Error] {e}", full_only=False)
     return ""
 
 
@@ -509,8 +518,18 @@ class BooruManagerApp(ctk.CTk):
         )
         self.lbl_serpapi_info.pack(pady=(0, 4), padx=10, fill="x")
 
-        self.ent_serpapi_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="SerpApi Key (Optional)")
-        self.ent_serpapi_key.pack(pady=(0, 10), padx=10, fill="x")
+        # Dynamic Key Lists containers
+        self.serpapi_entries = []
+        self.gvision_entries = []
+        self.db_user_entries = []
+        self.db_key_entries = []
+        self.gb_user_entries = []
+        self.gb_key_entries = []
+        self.skey_entries = []
+
+        self.serpapi_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.serpapi_list_frame.pack(fill="x", padx=5, pady=(0, 5))
+        self.add_serpapi_field()
 
         self.switch_gvision = ctk.CTkSwitch(self.api_credentials_container, text="Enable Google Cloud Vision API")
         self.switch_gvision.pack(pady=(5, 2), padx=10, anchor="w")
@@ -522,24 +541,38 @@ class BooruManagerApp(ctk.CTk):
         )
         self.lbl_gvision_info.pack(pady=(0, 4), padx=10, fill="x")
 
-        self.ent_gvision_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Google Cloud Vision Key (Optional)")
-        self.ent_gvision_key.pack(pady=(0, 10), padx=10, fill="x")
+        self.gvision_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.gvision_list_frame.pack(fill="x", padx=5, pady=(0, 5))
+        self.add_gvision_field()
 
         self.switch_skip_on_web_fail = ctk.CTkSwitch(self.api_credentials_container, text="Treat as Unmatched if Web Search Fails")
         self.switch_skip_on_web_fail.pack(pady=(0, 10), padx=10, anchor="w")
 
-        self.ent_db_user = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Danbooru User ID (Optional)")
-        self.ent_db_user.pack(pady=5, padx=10, fill="x")
-        self.ent_db_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Danbooru API Key (Optional)")
-        self.ent_db_key.pack(pady=(0, 10), padx=10, fill="x")
+        # Danbooru fields
+        ctk.CTkLabel(self.api_credentials_container, text="Danbooru Credentials (Optional):", font=ctk.CTkFont(size=11, weight="bold"), anchor="w").pack(padx=10, anchor="w", pady=(5, 2))
+        self.db_user_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.db_user_list_frame.pack(fill="x", padx=5, pady=(0, 2))
+        self.add_db_user_field()
 
-        self.ent_gb_user = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Gelbooru User ID (Optional)")
-        self.ent_gb_user.pack(pady=5, padx=10, fill="x")
-        self.ent_gb_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Gelbooru API Key (Optional)")
-        self.ent_gb_key.pack(pady=(0, 10), padx=10, fill="x")
+        self.db_key_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.db_key_list_frame.pack(fill="x", padx=5, pady=(0, 8))
+        self.add_db_key_field()
 
-        self.ent_skey = ctk.CTkEntry(self.api_credentials_container, placeholder_text="SauceNAO API Key (Optional)")
-        self.ent_skey.pack(pady=(0, 10), padx=10, fill="x")
+        # Gelbooru fields
+        ctk.CTkLabel(self.api_credentials_container, text="Gelbooru Credentials (Optional):", font=ctk.CTkFont(size=11, weight="bold"), anchor="w").pack(padx=10, anchor="w", pady=(5, 2))
+        self.gb_user_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.gb_user_list_frame.pack(fill="x", padx=5, pady=(0, 2))
+        self.add_gb_user_field()
+
+        self.gb_key_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.gb_key_list_frame.pack(fill="x", padx=5, pady=(0, 8))
+        self.add_gb_key_field()
+
+        # SauceNAO fields
+        ctk.CTkLabel(self.api_credentials_container, text="SauceNAO API Keys (Optional):", font=ctk.CTkFont(size=11, weight="bold"), anchor="w").pack(padx=10, anchor="w", pady=(5, 2))
+        self.skey_list_frame = ctk.CTkFrame(self.api_credentials_container, fg_color="transparent")
+        self.skey_list_frame.pack(fill="x", padx=5, pady=(0, 10))
+        self.add_skey_field()
 
         self.lbl_lm = ctk.CTkLabel(self.api_credentials_container, text="Local LLM API Base URL:\n(LM Studio / Ollama OpenAI Endpoint)", anchor="w", justify="left", font=ctk.CTkFont(size=11, weight="bold"))
         self.lbl_lm.pack(pady=(5, 2), padx=10, fill="x")
@@ -735,8 +768,117 @@ class BooruManagerApp(ctk.CTk):
         self.history_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self.history_scroll.grid_columnconfigure(0, weight=1)
 
+        # History Header Clarification Labels
+        self.history_header_frame = ctk.CTkFrame(self.history_scroll, fg_color="transparent")
+        self.history_header_frame.pack(fill="x", padx=5, pady=(0, 2))
+        
+        lbl_local_hdr = ctk.CTkLabel(self.history_header_frame, text="Local Image", font=ctk.CTkFont(size=11, weight="bold"), width=70, anchor="center")
+        lbl_local_hdr.pack(side="left", padx=(10, 5))
+        
+        lbl_match_hdr = ctk.CTkLabel(self.history_header_frame, text="Matched Artwork", font=ctk.CTkFont(size=11, weight="bold"), width=70, anchor="center")
+        lbl_match_hdr.pack(side="left", padx=(0, 10))
+
         self.on_unmatched_change(self.opt_unmatched.get())
         self.load_settings()
+
+    # Dynamic API key field helpers with + / - buttons
+    def add_serpapi_field(self, val=""):
+        row = ctk.CTkFrame(self.serpapi_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="SerpApi Key (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_serpapi_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.serpapi_entries, ent))
+        btn_rem.pack(side="left")
+        self.serpapi_entries.append((row, ent))
+
+    def add_gvision_field(self, val=""):
+        row = ctk.CTkFrame(self.gvision_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="Google Cloud Vision Key (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_gvision_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.gvision_entries, ent))
+        btn_rem.pack(side="left")
+        self.gvision_entries.append((row, ent))
+
+    def add_db_user_field(self, val=""):
+        row = ctk.CTkFrame(self.db_user_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="Danbooru User ID (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_db_user_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.db_user_entries, ent))
+        btn_rem.pack(side="left")
+        self.db_user_entries.append((row, ent))
+
+    def add_db_key_field(self, val=""):
+        row = ctk.CTkFrame(self.db_key_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="Danbooru API Key (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_db_key_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.db_key_entries, ent))
+        btn_rem.pack(side="left")
+        self.db_key_entries.append((row, ent))
+
+    def add_gb_user_field(self, val=""):
+        row = ctk.CTkFrame(self.gb_user_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="Gelbooru User ID (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_gb_user_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.gb_user_entries, ent))
+        btn_rem.pack(side="left")
+        self.gb_user_entries.append((row, ent))
+
+    def add_gb_key_field(self, val=""):
+        row = ctk.CTkFrame(self.gb_key_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="Gelbooru API Key (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_gb_key_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.gb_key_entries, ent))
+        btn_rem.pack(side="left")
+        self.gb_key_entries.append((row, ent))
+
+    def add_skey_field(self, val=""):
+        row = ctk.CTkFrame(self.skey_list_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ent = ctk.CTkEntry(row, placeholder_text="SauceNAO API Key (Optional)")
+        ent.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        if val: ent.insert(0, val)
+        
+        btn_add = ctk.CTkButton(row, text="+", width=28, height=28, fg_color="#2b8a3e", hover_color="#237032", command=lambda: self.add_skey_field())
+        btn_add.pack(side="left", padx=2)
+        btn_rem = ctk.CTkButton(row, text="-", width=28, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.remove_key_row(row, self.skey_entries, ent))
+        btn_rem.pack(side="left")
+        self.skey_entries.append((row, ent))
+
+    def remove_key_row(self, row_frame, entry_list, ent_widget):
+        if len(entry_list) > 1:
+            entry_list[:] = [item for item in entry_list if item[1] != ent_widget]
+            row_frame.destroy()
+        else:
+            ent_widget.delete(0, 'end')
 
     def toggle_api_panel(self):
         if self.api_panel_visible:
@@ -791,8 +933,16 @@ class BooruManagerApp(ctk.CTk):
             self.refresh_history_view()
 
     def refresh_history_view(self):
-        for widget in self.history_scroll.winfo_children():
+        for widget in list(self.history_scroll.winfo_children()):
             widget.destroy()
+
+        # Re-add header labels
+        self.history_header_frame = ctk.CTkFrame(self.history_scroll, fg_color="transparent")
+        self.history_header_frame.pack(fill="x", padx=5, pady=(0, 2))
+        lbl_local_hdr = ctk.CTkLabel(self.history_header_frame, text="Local Image", font=ctk.CTkFont(size=11, weight="bold"), width=70, anchor="center")
+        lbl_local_hdr.pack(side="left", padx=(10, 5))
+        lbl_match_hdr = ctk.CTkLabel(self.history_header_frame, text="Matched Artwork", font=ctk.CTkFont(size=11, weight="bold"), width=70, anchor="center")
+        lbl_match_hdr.pack(side="left", padx=(0, 10))
 
         filtered = self.get_filtered_history_items()
         total_items = len(filtered)
@@ -1100,9 +1250,7 @@ class BooruManagerApp(ctk.CTk):
             "fallback": self.switch_engine_fallback.get(),
             "vision_fallback": self.switch_vision_fallback.get(),
             "serpapi_enabled": self.switch_serpapi.get(),
-            "serpapi_key": self.ent_serpapi_key.get(),
             "gvision_enabled": self.switch_gvision.get(),
-            "gvision_key": self.ent_gvision_key.get(),
             "skip_on_web_fail": self.switch_skip_on_web_fail.get(),
             "vision_warning_shown": self.vision_warning_shown,
             "scan_subfolders": self.switch_scan_subfolders.get(),
@@ -1114,11 +1262,13 @@ class BooruManagerApp(ctk.CTk):
             "meta_character": self.switch_meta_character.get(),
             "meta_general": self.switch_meta_general.get(),
             "meta_meta": self.switch_meta_meta.get(),
-            "db_user": self.ent_db_user.get(),
-            "db_key": self.ent_db_key.get(),
-            "gb_user": self.ent_gb_user.get(),
-            "gb_key": self.ent_gb_key.get(),
-            "skey": self.ent_skey.get(),
+            "serpapi_keys": [ent.get().strip() for _, ent in self.serpapi_entries if ent.get().strip()],
+            "gvision_keys": [ent.get().strip() for _, ent in self.gvision_entries if ent.get().strip()],
+            "db_users": [ent.get().strip() for _, ent in self.db_user_entries if ent.get().strip()],
+            "db_keys": [ent.get().strip() for _, ent in self.db_key_entries if ent.get().strip()],
+            "gb_users": [ent.get().strip() for _, ent in self.gb_user_entries if ent.get().strip()],
+            "gb_keys": [ent.get().strip() for _, ent in self.gb_key_entries if ent.get().strip()],
+            "skeys": [ent.get().strip() for _, ent in self.skey_entries if ent.get().strip()],
             "lm_url": self.ent_lm.get(),
             "serpapi_counter": tracker.serpapi_calls,
             "gvision_counter": tracker.gvision_calls
@@ -1159,18 +1309,28 @@ class BooruManagerApp(ctk.CTk):
             if config.get("serpapi_enabled", 0): self.switch_serpapi.select()
             else: self.switch_serpapi.deselect()
 
-            serpapi_key = config.get("serpapi_key", "")
-            if serpapi_key:
-                self.ent_serpapi_key.delete(0, 'end')
-                self.ent_serpapi_key.insert(0, serpapi_key)
+            # Load multi keys
+            for list_frame, entries, vals, add_func in [
+                (self.serpapi_list_frame, self.serpapi_entries, config.get("serpapi_keys", [config.get("serpapi_key", "")]), self.add_serpapi_field),
+                (self.gvision_list_frame, self.gvision_entries, config.get("gvision_keys", [config.get("gvision_key", "")]), self.add_gvision_field),
+                (self.db_user_list_frame, self.db_user_entries, config.get("db_users", [config.get("db_user", "")]), self.add_db_user_field),
+                (self.db_key_list_frame, self.db_key_entries, config.get("db_keys", [config.get("db_key", "")]), self.add_db_key_field),
+                (self.gb_user_list_frame, self.gb_user_entries, config.get("gb_users", [config.get("gb_user", "")]), self.add_gb_user_field),
+                (self.gb_key_list_frame, self.gb_key_entries, config.get("gb_keys", [config.get("gb_key", "")]), self.add_gb_key_field),
+                (self.skey_list_frame, self.skey_entries, config.get("skeys", [config.get("skey", "")]), self.add_skey_field),
+            ]:
+                if vals:
+                    for row, ent in list(entries):
+                        row.destroy()
+                    entries.clear()
+                    for v in vals:
+                        if v.strip():
+                            add_func(v.strip())
+                    if not entries:
+                        add_func()
 
             if config.get("gvision_enabled", 0): self.switch_gvision.select()
             else: self.switch_gvision.deselect()
-
-            gvision_key = config.get("gvision_key", "")
-            if gvision_key:
-                self.ent_gvision_key.delete(0, 'end')
-                self.ent_gvision_key.insert(0, gvision_key)
 
             if config.get("skip_on_web_fail", 0): self.switch_skip_on_web_fail.select()
             else: self.switch_skip_on_web_fail.deselect()
@@ -1205,31 +1365,6 @@ class BooruManagerApp(ctk.CTk):
 
             if config.get("meta_meta", 0): self.switch_meta_meta.select()
             else: self.switch_meta_meta.deselect()
-            
-            db_user = config.get("db_user", "")
-            if db_user:
-                self.ent_db_user.delete(0, 'end')
-                self.ent_db_user.insert(0, db_user)
-
-            db_key = config.get("db_key", "")
-            if db_key:
-                self.ent_db_key.delete(0, 'end')
-                self.ent_db_key.insert(0, db_key)
-
-            gb_user = config.get("gb_user", "")
-            if gb_user:
-                self.ent_gb_user.delete(0, 'end')
-                self.ent_gb_user.insert(0, gb_user)
-
-            gb_key = config.get("gb_key", "")
-            if gb_key:
-                self.ent_gb_key.delete(0, 'end')
-                self.ent_gb_key.insert(0, gb_key)
-
-            skey = config.get("skey", "")
-            if skey:
-                self.ent_skey.delete(0, 'end')
-                self.ent_skey.insert(0, skey)
 
             self.ent_lm.delete(0, 'end')
             self.ent_lm.insert(0, config.get("lm_url", "http://localhost:1234/v1"))
@@ -1543,70 +1678,76 @@ class BooruManagerApp(ctk.CTk):
                 self.log(f"  [IQDB Error] {e}", full_only=False)
         return []
 
-    def search_saucenao_engine(self, file_path, api_key, is_fallback=False):
-        recorded = tracker.saucenao_limiter.record(self.log, block=not is_fallback)
-        if not recorded:
-            self.log("  [Rate Limit] SauceNAO fallback on cooldown. Skipping fallback search...")
-            return []
-        self.update_metrics_display()
+    def search_saucenao_engine(self, file_path, api_keys, is_fallback=False):
+        if isinstance(api_keys, str):
+            api_keys = [api_keys]
 
-        booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None, 'pixiv': None}
-        primary_title, best_thumb, fallback_ext_url = "", "", ""
-        max_similarity = 0.0
+        for key_idx, api_key in enumerate(api_keys):
+            if not api_key.strip():
+                continue
+            recorded = tracker.saucenao_limiter.record(self.log, block=not is_fallback)
+            if not recorded:
+                self.log("  [Rate Limit] SauceNAO fallback on cooldown. Skipping fallback search...")
+                return []
+            self.update_metrics_display()
 
-        try:
-            params = {'output_type': 2, 'numres': 5, 'hide': 0, 'api_key': api_key}
-            with open(file_path, 'rb') as f:
-                res = requests.post("https://saucenao.com/search.php", params=params, files={'file': f}, timeout=15)
-                
-            if res.status_code == 200:
-                results = res.json().get('results', [])
-                for r in results:
-                    if self.stop_requested or self.skip_requested: break
-                    data = r.get('data', {})
-                    header = r.get('header', {})
+            booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None, 'pixiv': None}
+            primary_title, best_thumb, fallback_ext_url = "", "", ""
+            max_similarity = 0.0
+
+            try:
+                params = {'output_type': 2, 'numres': 5, 'hide': 0, 'api_key': api_key.strip()}
+                with open(file_path, 'rb') as f:
+                    res = requests.post("https://saucenao.com/search.php", params=params, files={'file': f}, timeout=15)
                     
-                    try:
-                        sim_val = float(header.get('similarity', 0))
-                        if sim_val < 75.0:
-                            self.log(f"  [SauceNAO] Ignored low-similarity match ({sim_val:.1f}% < 75.0%)", full_only=True)
-                            continue
-                        if sim_val > max_similarity:
-                            max_similarity = sim_val
-                            best_thumb = header.get('thumbnail', '')
-                    except: pass
+                if res.status_code == 200:
+                    results = res.json().get('results', [])
+                    for r in results:
+                        if self.stop_requested or self.skip_requested: break
+                        data = r.get('data', {})
+                        header = r.get('header', {})
+                        
+                        try:
+                            sim_val = float(header.get('similarity', 0))
+                            if sim_val < 75.0:
+                                self.log(f"  [SauceNAO #{key_idx+1}] Ignored low-similarity match ({sim_val:.1f}% < 75.0%)", full_only=True)
+                                continue
+                            if sim_val > max_similarity:
+                                max_similarity = sim_val
+                                best_thumb = header.get('thumbnail', '')
+                        except: pass
 
-                    if not primary_title: primary_title = data.get('title') or data.get('source', 'SauceNAO Match')
+                        if not primary_title: primary_title = data.get('title') or data.get('source', 'SauceNAO Match')
 
-                    if data.get('danbooru_id'): booru_ids['danbooru'] = str(data.get('danbooru_id'))
-                    if data.get('gelbooru_id'): booru_ids['gelbooru'] = str(data.get('gelbooru_id'))
-                    if data.get('yandere_id'): booru_ids['yandere'] = str(data.get('yandere_id'))
-                    if data.get('konachan_id'): booru_ids['konachan'] = str(data.get('konachan_id'))
-                    if data.get('pixiv_id'): booru_ids['pixiv'] = str(data.get('pixiv_id'))
+                        if data.get('danbooru_id'): booru_ids['danbooru'] = str(data.get('danbooru_id'))
+                        if data.get('gelbooru_id'): booru_ids['gelbooru'] = str(data.get('gelbooru_id'))
+                        if data.get('yandere_id'): booru_ids['yandere'] = str(data.get('yandere_id'))
+                        if data.get('konachan_id'): booru_ids['konachan'] = str(data.get('konachan_id'))
+                        if data.get('pixiv_id'): booru_ids['pixiv'] = str(data.get('pixiv_id'))
 
-                    for url in data.get('ext_urls', []):
-                        if not fallback_ext_url: fallback_ext_url = url
-                        if 'zerochan.net' in url and not booru_ids['zerochan']:
-                            z_id = url.split('/')[-1]
-                            if z_id.isdigit(): booru_ids['zerochan'] = z_id
-                        elif 'pixiv.net' in url and not booru_ids['pixiv']:
-                            m = re.search(r'illust_id=(\d+)', url) or re.search(r'/artworks/(\d+)', url)
-                            if m: booru_ids['pixiv'] = m.group(1)
+                        for url in data.get('ext_urls', []):
+                            if not fallback_ext_url: fallback_ext_url = url
+                            if 'zerochan.net' in url and not booru_ids['zerochan']:
+                                z_id = url.split('/')[-1]
+                                if z_id.isdigit(): booru_ids['zerochan'] = z_id
+                            elif 'pixiv.net' in url and not booru_ids['pixiv']:
+                                m = re.search(r'illust_id=(\d+)', url) or re.search(r'/artworks/(\d+)', url)
+                                if m: booru_ids['pixiv'] = m.group(1)
 
-                if max_similarity >= 75.0 and (any(booru_ids.values()) or primary_title or fallback_ext_url):
-                    return [{
-                        'engine': 'SauceNAO',
-                        'title': primary_title,
-                        'similarity': max_similarity,
-                        'booru_ids': booru_ids,
-                        'thumb': best_thumb,
-                        'fallback_url': fallback_ext_url
-                    }]
-            else:
-                self.log(f"  [SauceNAO Error] HTTP {res.status_code} ({res.reason}) - {res.text[:80]}", full_only=False)
-        except Exception as e:
-            if not self.stop_requested:
-                self.log(f"  [SauceNAO Error] {e}", full_only=False)
+                    if max_similarity >= 75.0 and (any(booru_ids.values()) or primary_title or fallback_ext_url):
+                        return [{
+                            'engine': f'SauceNAO (#{key_idx+1})',
+                            'title': primary_title,
+                            'similarity': max_similarity,
+                            'booru_ids': booru_ids,
+                            'thumb': best_thumb,
+                            'fallback_url': fallback_ext_url
+                        }]
+                else:
+                    self.log(f"  [SauceNAO #{key_idx+1} Error] HTTP {res.status_code} - {res.text[:80]}", full_only=False)
+            except Exception as e:
+                if not self.stop_requested:
+                    self.log(f"  [SauceNAO #{key_idx+1} Error] {e}", full_only=False)
         return []
 
     def search_local_vision_engine(self, file_path, client, model_id):
@@ -1617,21 +1758,19 @@ class BooruManagerApp(ctk.CTk):
             web_api_enabled_count = 0
 
             if self.switch_serpapi.get() == 1:
-                serpapi_key = self.ent_serpapi_key.get().strip()
-                if serpapi_key and not self.stop_requested:
+                serpapi_keys = [ent.get().strip() for _, ent in self.serpapi_entries if ent.get().strip()]
+                if serpapi_keys and not self.stop_requested:
                     web_api_enabled_count += 1
-                    web_context = fetch_google_lens_context(file_path, serpapi_key, self.log)
-                    tracker.serpapi_calls += 1
+                    web_context = fetch_google_lens_context(file_path, serpapi_keys, self.log)
                     self.update_metrics_display()
 
             if self.skip_requested or self.stop_requested: return []
 
             if not web_context and self.switch_gvision.get() == 1:
-                gvision_key = self.ent_gvision_key.get().strip()
-                if gvision_key and not self.stop_requested:
+                gvision_keys = [ent.get().strip() for _, ent in self.gvision_entries if ent.get().strip()]
+                if gvision_keys and not self.stop_requested:
                     web_api_enabled_count += 1
-                    web_context = fetch_google_vision_web_detection(file_path, gvision_key, self.log)
-                    tracker.gvision_calls += 1
+                    web_context = fetch_google_vision_web_detection(file_path, gvision_keys, self.log)
                     self.update_metrics_display()
 
             if self.skip_requested or self.stop_requested: return []
@@ -1720,11 +1859,16 @@ class BooruManagerApp(ctk.CTk):
                 self.log(f"  [Local Vision LLM Error] {e}", full_only=False)
         return []
 
-    def fetch_tags(self, file_path, match_meta, primary_choice, db_user, db_key, gb_user, gb_key):
+    def fetch_tags(self, file_path, match_meta, primary_choice):
         tag_data = {'artist': '', 'copyright': '', 'character': '', 'general': '', 'meta': '', 'combined': '', 'matched_url': ''}
         booru_ids = match_meta.get('booru_ids', {}) if match_meta else {}
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        db_headers = {'User-Agent': f"TagAIBooruSorter/1.0 (by {db_user if db_user else 'anonymous_user'})"}
+        
+        db_users = [ent.get().strip() for _, ent in self.db_user_entries if ent.get().strip()]
+        db_keys = [ent.get().strip() for _, ent in self.db_key_entries if ent.get().strip()]
+        gb_users = [ent.get().strip() for _, ent in self.gb_user_entries if ent.get().strip()]
+        gb_keys = [ent.get().strip() for _, ent in self.gb_key_entries if ent.get().strip()]
+
         confidence_order = ["danbooru", "yandere", "gelbooru", "konachan", "zerochan", "pixiv"]
 
         target_key = None
@@ -1751,10 +1895,31 @@ class BooruManagerApp(ctk.CTk):
                     tracker.danbooru_limiter.record(self.log)
                     self.update_metrics_display()
                     self.log(f"  Querying Danbooru ID: {ident}...")
-                    auth = (db_user, db_key) if (db_user and db_key) else None
-                    res = self.safe_get_request(f"https://danbooru.donmai.us/posts/{ident}.json", headers=db_headers, auth=auth, timeout=6)
-                    if res and res.status_code == 200:
-                        pdata = res.json()
+                    
+                    # Try backup credential combinations if primary fails
+                    success_danbooru = False
+                    pdata = {}
+                    
+                    auth_pairs = []
+                    if db_users and db_keys:
+                        for u, k in zip(db_users, db_keys):
+                            auth_pairs.append((u, k))
+                    if db_keys and not db_users:
+                        for k in db_keys:
+                            auth_pairs.append(("", k))
+                    if not auth_pairs:
+                        auth_pairs.append((None, None))
+
+                    for u, k in auth_pairs:
+                        db_headers = {'User-Agent': f"TagAIBooruSorter/1.0 (by {u if u else 'anonymous_user'})"}
+                        auth = (u, k) if (u or k) else None
+                        res = self.safe_get_request(f"https://danbooru.donmai.us/posts/{ident}.json", headers=db_headers, auth=auth, timeout=6)
+                        if res and res.status_code == 200:
+                            pdata = res.json()
+                            success_danbooru = True
+                            break
+
+                    if success_danbooru and pdata:
                         preview_url = pdata.get('preview_file_url') or pdata.get('large_file_url')
                         if preview_url: self.update_match_thumbnail(preview_url)
                         
@@ -1778,8 +1943,24 @@ class BooruManagerApp(ctk.CTk):
                         url = f"https://konachan.com/post.json?tags=id:{ident}"
                     elif source == 'gelbooru':
                         tracker.gelbooru_limiter.record(self.log)
-                        auth_params = f"&api_key={gb_key}&user_id={gb_user}" if (gb_user and gb_key) else ""
-                        url = f"https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&id={ident}{auth_params}"
+                        # Try with backup gelbooru credentials
+                        gb_pairs = []
+                        if gb_users and gb_keys:
+                            for u, k in zip(gb_users, gb_keys):
+                                gb_pairs.append((u, k))
+                        if gb_keys and not gb_users:
+                            for k in gb_keys:
+                                gb_pairs.append(("", k))
+                        if not gb_pairs:
+                            gb_pairs.append(("", ""))
+
+                        res = None
+                        for u, k in gb_pairs:
+                            auth_params = f"&api_key={k}&user_id={u}" if (u and k) else ""
+                            gel_url = f"https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&id={ident}{auth_params}"
+                            res = self.safe_get_request(gel_url, headers=headers, timeout=6)
+                            if res and res.status_code == 200:
+                                break
                     elif source == 'zerochan':
                         tracker.zerochan_limiter.record(self.log)
                         url = f"https://www.zerochan.net/{ident}?json"
@@ -1794,7 +1975,9 @@ class BooruManagerApp(ctk.CTk):
                     if source == 'pixiv':
                         req_headers['Referer'] = f"https://www.pixiv.net/artworks/{ident}"
 
-                    res = self.safe_get_request(url, headers=req_headers, timeout=6)
+                    if source != 'gelbooru':
+                        res = self.safe_get_request(url, headers=req_headers, timeout=6)
+
                     if res and res.status_code == 200:
                         if source == 'zerochan':
                             pdata = res.json()
@@ -1902,11 +2085,7 @@ class BooruManagerApp(ctk.CTk):
             engine_choice = self.opt_engine.get()
             tag_choice = self.opt_tags.get()
             exec_mode = self.opt_exec_mode.get()
-            saucenao_key = self.ent_skey.get().strip()
-            db_user = self.ent_db_user.get().strip()
-            db_key = self.ent_db_key.get().strip()
-            gb_user = self.ent_gb_user.get().strip()
-            gb_key = self.ent_gb_key.get().strip()
+            saucenao_keys = [ent.get().strip() for _, ent in self.skey_entries if ent.get().strip()]
             allow_engine_fallback = bool(self.switch_engine_fallback.get())
             allow_vision_fallback = bool(self.switch_vision_fallback.get())
             use_embedded = bool(self.switch_use_embedded_tags.get() == 1)
@@ -2011,12 +2190,12 @@ class BooruManagerApp(ctk.CTk):
                     if "IQDB" in primary_engine:
                         fallback_sequence = [
                             ('IQDB', lambda fp: self.search_iqdb_engine(fp, is_fallback=False)),
-                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_key, is_fallback=True)) if allow_engine_fallback else None,
+                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_keys, is_fallback=True)) if allow_engine_fallback else None,
                             ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id)) if allow_vision_fallback else None
                         ]
                     elif "SauceNAO" in primary_engine:
                         fallback_sequence = [
-                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_key, is_fallback=False)),
+                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_keys, is_fallback=False)),
                             ('IQDB', lambda fp: self.search_iqdb_engine(fp, is_fallback=True)) if allow_engine_fallback else None,
                             ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id)) if allow_vision_fallback else None
                         ]
@@ -2044,7 +2223,7 @@ class BooruManagerApp(ctk.CTk):
                             match_thumb = ''
                             break
                         
-                        test_tag_dict = self.fetch_tags(file_path, candidate_match, tag_choice, db_user, db_key, gb_user, gb_key)
+                        test_tag_dict = self.fetch_tags(file_path, candidate_match, tag_choice)
                         test_combined = test_tag_dict.get('combined', '')
                         
                         if test_combined:
