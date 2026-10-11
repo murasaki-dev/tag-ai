@@ -9,6 +9,8 @@ import hashlib
 import platform
 import subprocess
 import base64
+import sys
+import webbrowser
 from io import BytesIO
 from PIL import Image, PngImagePlugin
 from openai import OpenAI
@@ -16,20 +18,54 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from bs4 import BeautifulSoup
 
+# Fix window dragging lag across monitors with different DPI scalings on Windows
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+
+class StdoutRedirector:
+    """Redirects stdout and stderr to the GUI application log window."""
+    def __init__(self, log_callback):
+        self.log_callback = log_callback
+        self.terminal_out = sys.stdout
+
+    def write(self, message):
+        self.terminal_out.write(message)
+        cleaned = message.strip()
+        if cleaned:
+            self.log_callback(cleaned)
+
+    def flush(self):
+        self.terminal_out.flush()
+
 
 class WindowRateLimiter:
     def __init__(self, limit, period_seconds):
         self.limit = limit
         self.period_seconds = period_seconds
-        self.window_start = 0
+        self.window_start = time.time()
         self.window_calls = 0
         self.total_calls = 0
 
+    def get_current_window_calls(self):
+        now = time.time()
+        if now - self.window_start >= self.period_seconds:
+            self.window_start = now
+            self.window_calls = 0
+        return self.window_calls
+
     def record(self, log_callback=None, block=True):
         now = time.time()
-        if self.window_calls == 0 or now - self.window_start >= self.period_seconds:
+        if now - self.window_start >= self.period_seconds:
             self.window_start = now
             self.window_calls = 0
             
@@ -38,7 +74,7 @@ class WindowRateLimiter:
             if sleep_time > 0:
                 if not block:
                     return False
-                if log_callback: log_callback(f"  [Rate Limit] Cooldown triggered. Sleeping for {sleep_time:.1f}s...")
+                if log_callback: log_callback(f"  [Rate Limit] Cooldown triggered. Sleeping for {sleep_time:.1f}s...", full_only=False)
                 time.sleep(sleep_time)
             self.window_start = time.time()
             self.window_calls = 0
@@ -50,15 +86,26 @@ class WindowRateLimiter:
 
 class MultiWindowRateLimiter:
     def __init__(self, limits_and_periods):
-        self.limiters = [{"limit": l, "period": p, "start": 0, "calls": 0} for l, p in limits_and_periods]
+        self.limiters = [{"limit": l, "period": p, "start": time.time(), "calls": 0} for l, p in limits_and_periods]
         self.total_calls = 0
+
+    def get_status_str(self):
+        now = time.time()
+        statuses = []
+        for l in self.limiters:
+            if now - l["start"] >= l["period"]:
+                l["start"] = now
+                l["calls"] = 0
+            period_label = f"{l['period']}s" if l['period'] < 3600 else f"{l['period']//3600}h"
+            statuses.append(f"{l['calls']}/{l['limit']} ({period_label})")
+        return ", ".join(statuses)
 
     def record(self, log_callback=None, block=True):
         now = time.time()
         max_sleep = 0
         
         for limiter in self.limiters:
-            if limiter["calls"] == 0 or now - limiter["start"] >= limiter["period"]:
+            if now - limiter["start"] >= limiter["period"]:
                 limiter["start"] = now
                 limiter["calls"] = 0
                 
@@ -70,7 +117,7 @@ class MultiWindowRateLimiter:
         if max_sleep > 0:
             if not block:
                 return False
-            if log_callback: log_callback(f"  [Rate Limit] Multi-tier cooldown triggered. Sleeping for {max_sleep:.1f}s...")
+            if log_callback: log_callback(f"  [Rate Limit] Multi-tier cooldown triggered. Sleeping for {max_sleep:.1f}s...", full_only=False)
             time.sleep(max_sleep)
             now = time.time()
             for limiter in self.limiters:
@@ -98,7 +145,7 @@ class GentleRateLimiter:
             sleep_time = self.delay_seconds - elapsed
             if not block:
                 return False
-            if log_callback: log_callback(f"  [Rate Limit] Pacing requests. Sleeping for {sleep_time:.1f}s...")
+            if log_callback: log_callback(f"  [Rate Limit] Pacing requests. Sleeping for {sleep_time:.1f}s...", full_only=False)
             time.sleep(sleep_time)
         
         self.last_call_time = time.time()
@@ -109,12 +156,13 @@ class GentleRateLimiter:
 class ApiTracker:
     def __init__(self):
         self.iqdb_limiter = WindowRateLimiter(30, 60)
-        self.saucenao_limiter = MultiWindowRateLimiter([(4, 30), (100, 86400)])
+        self.saucenao_limiter = MultiWindowRateLimiter([(4, 32), (100, 86400)])
         self.danbooru_limiter = WindowRateLimiter(300, 60)
         self.gelbooru_limiter = GentleRateLimiter(1.5)
         self.yandere_limiter = GentleRateLimiter(1.5)
         self.konachan_limiter = GentleRateLimiter(1.5)
         self.zerochan_limiter = GentleRateLimiter(1.5)
+        self.pixiv_limiter = GentleRateLimiter(1.5)
         
         self.serpapi_counter = 0
         self.gvision_counter = 0
@@ -124,26 +172,25 @@ class ApiTracker:
         self.hash_cache = {}
 
         self.IQDB_LIMIT = "30/min"
-        self.SAUCENAO_LIMIT = "4/30s, 100/day"
+        self.SAUCENAO_LIMIT = "4/32s, 100/day"
         self.DANBOORU_LIMIT = "300/min"
         self.GELBOORU_LIMIT = "Gentle (~1-2s)"
         self.YANDERE_LIMIT = "Gentle (~1-2s)"
         self.KONACHAN_LIMIT = "Gentle (~1-2s)"
+        self.PIXIV_LIMIT = "Gentle (~1-2s)"
         self.SERPAPI_LIMIT = "250/month"
         self.GVISION_LIMIT = "1000/month"
 
     @property
-    def iqdb_calls(self): return self.iqdb_limiter.total_calls
+    def iqdb_calls(self): return self.iqdb_limiter.get_current_window_calls()
     @iqdb_calls.setter
     def iqdb_calls(self, value): self.iqdb_limiter.total_calls = value
 
     @property
-    def saucenao_calls(self): return self.saucenao_limiter.total_calls
-    @saucenao_calls.setter
-    def saucenao_calls(self, value): self.saucenao_limiter.total_calls = value
+    def saucenao_status(self): return self.saucenao_limiter.get_status_str()
 
     @property
-    def danbooru_calls(self): return self.danbooru_limiter.total_calls
+    def danbooru_calls(self): return self.danbooru_limiter.get_current_window_calls()
     @danbooru_calls.setter
     def danbooru_calls(self, value): self.danbooru_limiter.total_calls = value
 
@@ -168,6 +215,11 @@ class ApiTracker:
     def zerochan_calls(self, value): self.zerochan_limiter.total_calls = value
 
     @property
+    def pixiv_calls(self): return self.pixiv_limiter.total_calls
+    @pixiv_calls.setter
+    def pixiv_calls(self, value): self.pixiv_limiter.total_calls = value
+
+    @property
     def serpapi_calls(self): return self.serpapi_counter
     @serpapi_calls.setter
     def serpapi_calls(self, value): self.serpapi_counter = value
@@ -180,42 +232,57 @@ class ApiTracker:
 tracker = ApiTracker()
 
 def normalize_tag(tag_str):
-    """Replaces spaces within individual multi-word tags with underscores."""
     if not tag_str:
         return ""
     tags = [t.strip().replace(" ", "_") for t in tag_str.split() if t.strip()]
     return " ".join(tags)
 
 def sanitize_foldername(name):
-    """Removes Windows illegal characters: \ / : * ? " < > |"""
     if not name:
         return "Unsorted"
     return re.sub(r'[\\/:*?"<>|]', '', name).strip()
 
+def extract_embedded_tags(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    tag_text = ""
+    try:
+        with Image.open(file_path) as img:
+            if ext == '.png':
+                tag_text = img.info.get("booru_tags") or img.info.get("parameters", "")
+            elif ext in ['.jpg', '.jpeg']:
+                import piexif
+                exif_data = img.info.get('exif')
+                if exif_data:
+                    exif_dict = piexif.load(exif_data)
+                    user_comment = exif_dict.get("Exif", {}).get(piexif.ExifIFD.UserComment, b'')
+                    if user_comment:
+                        from piexif.helper import UserComment
+                        tag_text = UserComment.load(user_comment)
+    except Exception:
+        pass
+    return tag_text.strip()
+
+
 def fetch_google_lens_context(file_path, api_key, log_callback=None):
-    """Uploads local image to SerpApi Image API (auto-compressing if >500KB), gets an image_id, then queries Google Lens."""
-    if not api_key:
-        return ""
-    
     upload_path = file_path
     temp_compressed_path = None
     try:
         if os.path.getsize(file_path) > 500 * 1024:
-            if log_callback: log_callback("  [SerpApi] Image size exceeds 500KB limit. Optimizing/compressing for upload...")
-            img = Image.open(file_path)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            temp_compressed_path = file_path + "_serpapi_temp.jpg"
-            
-            quality = 90
-            while quality >= 20:
-                img.save(temp_compressed_path, "JPEG", quality=quality)
-                if os.path.getsize(temp_compressed_path) <= 500 * 1024:
-                    break
-                quality -= 15
+            if log_callback: log_callback("  [SerpApi] Image size exceeds 500KB limit. Optimizing/compressing for upload...", full_only=True)
+            with Image.open(file_path) as img:
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                temp_compressed_path = file_path + "_serpapi_temp.jpg"
+                
+                quality = 90
+                while quality >= 20:
+                    img.save(temp_compressed_path, "JPEG", quality=quality)
+                    if os.path.getsize(temp_compressed_path) <= 500 * 1024:
+                        break
+                    quality -= 15
             upload_path = temp_compressed_path
 
-        if log_callback: log_callback("  [SerpApi] Uploading image to SerpApi Image API...")
+        if log_callback: log_callback("  [SerpApi] Uploading image to SerpApi Image API...", full_only=True)
         
         upload_url = "https://serpapi.com/image"
         with open(upload_path, "rb") as img_file:
@@ -227,16 +294,16 @@ def fetch_google_lens_context(file_path, api_key, log_callback=None):
             )
             
         if upload_response.status_code != 200:
-            if log_callback: log_callback(f"  [SerpApi Warning] Image upload failed (HTTP {upload_response.status_code}): {upload_response.text}")
+            if log_callback: log_callback(f"  [SerpApi Error] Upload failed (HTTP {upload_response.status_code}): {upload_response.text[:100]}", full_only=False)
             return ""
             
         upload_data = upload_response.json()
         image_id = upload_data.get("image_id")
         if not image_id:
-            if log_callback: log_callback(f"  [SerpApi Warning] No image_id returned: {upload_data}")
+            if log_callback: log_callback(f"  [SerpApi Warning] No image_id returned: {upload_data}", full_only=False)
             return ""
             
-        if log_callback: log_callback("  [SerpApi] Querying Google Lens web index using image_id...")
+        if log_callback: log_callback("  [SerpApi] Querying Google Lens web index using image_id...", full_only=True)
         
         search_url = "https://serpapi.com/search"
         params = {
@@ -254,24 +321,31 @@ def fetch_google_lens_context(file_path, api_key, log_callback=None):
             
             kg = data.get("knowledge_graph", [])
             if kg and isinstance(kg, list):
-                title = kg[0].get("title", "")
-                subtitle = kg[0].get("subtitle", "")
-                if title: snippets.append(f"Identified Entity: {title} ({subtitle})")
+                for item in kg:
+                    title = item.get("title", "")
+                    subtitle = item.get("subtitle", "")
+                    if title: snippets.append(f"Entity: {title} ({subtitle})")
 
-            visual_matches = data.get("visual_matches", [])
-            for match in visual_matches[:5]:
-                m_title = match.get("title", "")
-                m_source = match.get("source", "")
-                if m_title: snippets.append(f"Match: {m_title} (Source: {m_source})")
+            for key in ["visual_matches", "images_results", "inline_images"]:
+                matches = data.get(key, [])
+                if matches and isinstance(matches, list):
+                    for match in matches[:6]:
+                        m_title = match.get("title", "")
+                        m_source = match.get("source", "")
+                        m_link = match.get("link", "")
+                        if m_title: 
+                            snippets.append(f"Match: {m_title} (Source: {m_source}, Link: {m_link})")
                 
             if snippets:
                 context_text = "\n".join(snippets)
-                if log_callback: log_callback(f"  [SerpApi SUCCESS] Found {len(snippets)} search context references!")
+                if log_callback: log_callback(f"  [SerpApi SUCCESS] Found {len(snippets)} search context references!", full_only=True)
                 return context_text
+            else:
+                if log_callback: log_callback("  [SerpApi Warning] Search completed successfully, but returned empty match lists in JSON structure.", full_only=False)
         else:
-            if log_callback: log_callback(f"  [SerpApi Warning] Search failed (HTTP {response.status_code}): {response.text}")
+            if log_callback: log_callback(f"  [SerpApi Error] Search failed (HTTP {response.status_code}): {response.text[:100]}", full_only=False)
     except Exception as e:
-        if log_callback: log_callback(f"  [SerpApi Warning] Search query failed: {e}")
+        if log_callback: log_callback(f"  [SerpApi Error] {e}", full_only=False)
     finally:
         if temp_compressed_path and os.path.exists(temp_compressed_path):
             try: os.remove(temp_compressed_path)
@@ -280,13 +354,12 @@ def fetch_google_lens_context(file_path, api_key, log_callback=None):
 
 
 def fetch_google_vision_web_detection(file_path, api_key, log_callback=None):
-    """Sends local image to Google Cloud Vision Web Detection API and returns entity/matching web snippets."""
     if not api_key:
         return ""
     
     url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
     try:
-        if log_callback: log_callback("  [Google Vision] Querying Google Cloud Vision Web Detection API...")
+        if log_callback: log_callback("  [Google Vision] Querying Google Cloud Vision Web Detection API...", full_only=True)
         with open(file_path, "rb") as image_file:
             encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
             
@@ -320,12 +393,12 @@ def fetch_google_vision_web_detection(file_path, api_key, log_callback=None):
                     
             if snippets:
                 context_text = "\n".join(snippets)
-                if log_callback: log_callback(f"  [Google Vision SUCCESS] Found {len(snippets)} search context references!")
+                if log_callback: log_callback(f"  [Google Vision SUCCESS] Found {len(snippets)} search context references!", full_only=True)
                 return context_text
         else:
-            if log_callback: log_callback(f"  [Google Vision Warning] Request failed (HTTP {response.status_code}): {response.text}")
+            if log_callback: log_callback(f"  [Google Vision Error] HTTP {response.status_code}: {response.text[:100]}", full_only=False)
     except Exception as e:
-        if log_callback: log_callback(f"  [Google Vision Warning] Request failed: {e}")
+        if log_callback: log_callback(f"  [Google Vision Error] {e}", full_only=False)
     return ""
 
 
@@ -339,6 +412,9 @@ class BooruManagerApp(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        sys.stdout = StdoutRedirector(self.log)
+        sys.stderr = StdoutRedirector(self.log)
+
         self.is_processing = False
         self.stop_requested = False
         self.skip_requested = False
@@ -347,6 +423,11 @@ class BooruManagerApp(ctk.CTk):
         self.dest_path = os.path.abspath("./organized_library")
         self.unmatched_path = ""
         self.vision_warning_shown = False
+        self.api_panel_visible = True
+        
+        self.history_items = []
+        self.history_page = 0
+        self.history_per_page = 50
         
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -395,7 +476,7 @@ class BooruManagerApp(ctk.CTk):
 
         self.lbl_tags = ctk.CTkLabel(self.scroll_frame, text="Target Tag Database:", anchor="w")
         self.lbl_tags.pack(pady=(5, 0), padx=10, fill="x")
-        self.opt_tags = ctk.CTkOptionMenu(self.scroll_frame, values=["Auto (Highest Confidence)", "Yande.re", "Danbooru", "Gelbooru", "Konachan", "Zerochan"])
+        self.opt_tags = ctk.CTkOptionMenu(self.scroll_frame, values=["Auto (Highest Confidence)", "Yande.re", "Danbooru", "Gelbooru", "Konachan", "Zerochan", "Pixiv"])
         self.opt_tags.pack(pady=(0, 10), padx=10, fill="x")
 
         self.switch_engine_fallback = ctk.CTkSwitch(self.scroll_frame, text="Enable Search Engine Fallback")
@@ -404,38 +485,67 @@ class BooruManagerApp(ctk.CTk):
 
         self.switch_vision_fallback = ctk.CTkSwitch(self.scroll_frame, text="Allow Local Vision LLM as Fallback")
         self.switch_vision_fallback.pack(pady=(0, 10), padx=10, anchor="w")
-        self.switch_vision_fallback.select()
 
-        # SerpApi Controls
-        self.switch_serpapi = ctk.CTkSwitch(self.scroll_frame, text="Enable SerpApi Google Lens")
+        self.btn_toggle_api_panel = ctk.CTkButton(
+            self.scroll_frame, 
+            text="⚙️ Hide API & Credentials Panel", 
+            command=self.toggle_api_panel, 
+            fg_color="#495057", 
+            hover_color="#343a40",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.btn_toggle_api_panel.pack(pady=(10, 10), padx=10, fill="x")
+
+        self.api_credentials_container = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+        self.api_credentials_container.pack(pady=(0, 5), padx=0, fill="x")
+
+        self.switch_serpapi = ctk.CTkSwitch(self.api_credentials_container, text="Enable SerpApi Google Lens")
         self.switch_serpapi.pack(pady=(5, 2), padx=10, anchor="w")
 
         self.lbl_serpapi_info = ctk.CTkLabel(
-            self.scroll_frame, 
-            text="Max filesize: 500KB (auto-compressed if larger). Limit: 250 searches/month.", 
+            self.api_credentials_container, 
+            text="Max filesize: 500KB (auto-compressed). Limit: 250/month.", 
             anchor="w", justify="left", font=ctk.CTkFont(size=10), text_color="gray", wraplength=260
         )
         self.lbl_serpapi_info.pack(pady=(0, 4), padx=10, fill="x")
 
-        self.ent_serpapi_key = ctk.CTkEntry(self.scroll_frame, placeholder_text="SerpApi Key (Optional)")
+        self.ent_serpapi_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="SerpApi Key (Optional)")
         self.ent_serpapi_key.pack(pady=(0, 10), padx=10, fill="x")
 
-        # Google Cloud Vision API Controls
-        self.switch_gvision = ctk.CTkSwitch(self.scroll_frame, text="Enable Google Cloud Vision API")
+        self.switch_gvision = ctk.CTkSwitch(self.api_credentials_container, text="Enable Google Cloud Vision API")
         self.switch_gvision.pack(pady=(5, 2), padx=10, anchor="w")
 
         self.lbl_gvision_info = ctk.CTkLabel(
-            self.scroll_frame, 
+            self.api_credentials_container, 
             text="Web Detection. Free limit: 1,000 requests/month.", 
             anchor="w", justify="left", font=ctk.CTkFont(size=10), text_color="gray", wraplength=260
         )
         self.lbl_gvision_info.pack(pady=(0, 4), padx=10, fill="x")
 
-        self.ent_gvision_key = ctk.CTkEntry(self.scroll_frame, placeholder_text="Google Cloud Vision Key (Optional)")
+        self.ent_gvision_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Google Cloud Vision Key (Optional)")
         self.ent_gvision_key.pack(pady=(0, 10), padx=10, fill="x")
 
-        self.switch_skip_on_web_fail = ctk.CTkSwitch(self.scroll_frame, text="Treat as Unmatched if Web Search Fails")
-        self.switch_skip_on_web_fail.pack(pady=(0, 15), padx=10, anchor="w")
+        self.switch_skip_on_web_fail = ctk.CTkSwitch(self.api_credentials_container, text="Treat as Unmatched if Web Search Fails")
+        self.switch_skip_on_web_fail.pack(pady=(0, 10), padx=10, anchor="w")
+
+        self.ent_db_user = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Danbooru User ID (Optional)")
+        self.ent_db_user.pack(pady=5, padx=10, fill="x")
+        self.ent_db_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Danbooru API Key (Optional)")
+        self.ent_db_key.pack(pady=(0, 10), padx=10, fill="x")
+
+        self.ent_gb_user = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Gelbooru User ID (Optional)")
+        self.ent_gb_user.pack(pady=5, padx=10, fill="x")
+        self.ent_gb_key = ctk.CTkEntry(self.api_credentials_container, placeholder_text="Gelbooru API Key (Optional)")
+        self.ent_gb_key.pack(pady=(0, 10), padx=10, fill="x")
+
+        self.ent_skey = ctk.CTkEntry(self.api_credentials_container, placeholder_text="SauceNAO API Key (Optional)")
+        self.ent_skey.pack(pady=(0, 10), padx=10, fill="x")
+
+        self.lbl_lm = ctk.CTkLabel(self.api_credentials_container, text="Local LLM API Base URL:\n(LM Studio / Ollama OpenAI Endpoint)", anchor="w", justify="left", font=ctk.CTkFont(size=11, weight="bold"))
+        self.lbl_lm.pack(pady=(5, 2), padx=10, fill="x")
+        self.ent_lm = ctk.CTkEntry(self.api_credentials_container)
+        self.ent_lm.insert(0, "http://localhost:1234/v1")
+        self.ent_lm.pack(pady=(0, 10), padx=10, fill="x")
 
         self.lbl_subfolder_warning = ctk.CTkLabel(
             self.scroll_frame, 
@@ -446,6 +556,19 @@ class BooruManagerApp(ctk.CTk):
 
         self.switch_scan_subfolders = ctk.CTkSwitch(self.scroll_frame, text="Scan Immediate Subfolders")
         self.switch_scan_subfolders.pack(pady=(0, 10), padx=10, anchor="w")
+
+        self.switch_use_embedded_tags = ctk.CTkSwitch(
+            self.scroll_frame, 
+            text="Use Existing Embedded Tags (Skip Search)", 
+            command=self.on_use_embedded_tags_toggle
+        )
+        self.switch_use_embedded_tags.pack(pady=(5, 6), padx=10, anchor="w")
+
+        self.switch_skip_no_embedded = ctk.CTkSwitch(
+            self.scroll_frame, 
+            text="Skip if No Embedded Tags Found", 
+            font=ctk.CTkFont(size=11)
+        )
 
         self.meta_container = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         self.meta_container.pack(pady=(5, 10), padx=10, fill="x")
@@ -478,25 +601,6 @@ class BooruManagerApp(ctk.CTk):
         self.switch_meta_meta.pack(pady=(2, 8), padx=15, anchor="w")
         self.switch_meta_meta.deselect()
 
-        self.ent_db_user = ctk.CTkEntry(self.scroll_frame, placeholder_text="Danbooru User ID (Optional)")
-        self.ent_db_user.pack(pady=5, padx=10, fill="x")
-        self.ent_db_key = ctk.CTkEntry(self.scroll_frame, placeholder_text="Danbooru API Key (Optional)")
-        self.ent_db_key.pack(pady=(0, 10), padx=10, fill="x")
-
-        self.ent_gb_user = ctk.CTkEntry(self.scroll_frame, placeholder_text="Gelbooru User ID (Optional)")
-        self.ent_gb_user.pack(pady=5, padx=10, fill="x")
-        self.ent_gb_key = ctk.CTkEntry(self.scroll_frame, placeholder_text="Gelbooru API Key (Optional)")
-        self.ent_gb_key.pack(pady=(0, 10), padx=10, fill="x")
-
-        self.ent_skey = ctk.CTkEntry(self.scroll_frame, placeholder_text="SauceNAO API Key (Optional)")
-        self.ent_skey.pack(pady=(0, 15), padx=10, fill="x")
-
-        self.lbl_lm = ctk.CTkLabel(self.scroll_frame, text="Local LLM API Base URL:\n(LM Studio / Ollama OpenAI Endpoint)", anchor="w", justify="left", font=ctk.CTkFont(size=11, weight="bold"))
-        self.lbl_lm.pack(pady=(5, 2), padx=10, fill="x")
-        self.ent_lm = ctk.CTkEntry(self.scroll_frame)
-        self.ent_lm.insert(0, "http://localhost:1234/v1")
-        self.ent_lm.pack(pady=(0, 10), padx=10, fill="x")
-
         self.bottom_frame = ctk.CTkFrame(self.sidebar_container, fg_color="transparent")
         self.bottom_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(10, 20))
         self.bottom_frame.grid_columnconfigure((0, 1), weight=1)
@@ -514,7 +618,6 @@ class BooruManagerApp(ctk.CTk):
         self.btn_export.grid(row=3, column=0, padx=5, pady=(10, 0), sticky="ew")
 
         self.btn_import = ctk.CTkButton(self.bottom_frame, text="Import Data", command=self.import_settings, fg_color="#495057", hover_color="#343a40")
-        self.btn_export.grid(row=3, column=0, padx=5, pady=(10, 0), sticky="ew")
         self.btn_import.grid(row=3, column=1, padx=5, pady=(10, 0), sticky="ew")
 
         self.btn_clear_cache = ctk.CTkButton(self.bottom_frame, text="Clear App Cache & History", command=self.clear_app_cache, fg_color="#d9480f", hover_color="#c92a2a")
@@ -582,16 +685,30 @@ class BooruManagerApp(ctk.CTk):
         self.lbl_files_moved = ctk.CTkLabel(self.counter_frame, text="Files Moved This Session: 0", font=ctk.CTkFont(size=11, weight="bold"))
         self.lbl_files_moved.grid(row=3, column=0, columnspan=3, padx=10, pady=4, sticky="w")
 
-        self.txt_console = ctk.CTkTextbox(self.tab_monitor, wrap="word", font=ctk.CTkFont(family="Courier", size=12))
-        self.txt_console.grid(row=2, column=0, sticky="nsew")
-        self.txt_console.insert("0.0", "System initialized. Universal search fallbacks active.\n")
+        self.console_tabview = ctk.CTkTabview(self.tab_monitor)
+        self.console_tabview.grid(row=2, column=0, sticky="nsew")
+
+        self.tab_simp = self.console_tabview.add("Simplified Logs")
+        self.tab_full = self.console_tabview.add("Full Logs")
+
+        self.tab_simp.grid_rowconfigure(0, weight=1)
+        self.tab_simp.grid_columnconfigure(0, weight=1)
+        self.txt_console_simp = ctk.CTkTextbox(self.tab_simp, wrap="word", font=ctk.CTkFont(family="Courier", size=12))
+        self.txt_console_simp.grid(row=0, column=0, sticky="nsew")
+        self.txt_console_simp.insert("0.0", "System initialized. Simplified logs active.\n")
+
+        self.tab_full.grid_rowconfigure(0, weight=1)
+        self.tab_full.grid_columnconfigure(0, weight=1)
+        self.txt_console_full = ctk.CTkTextbox(self.tab_full, wrap="word", font=ctk.CTkFont(family="Courier", size=12))
+        self.txt_console_full.grid(row=0, column=0, sticky="nsew")
+        self.txt_console_full.insert("0.0", "System initialized. Full audit & debug logs active.\n")
 
         self.tab_history.grid_rowconfigure(1, weight=1)
         self.tab_history.grid_columnconfigure(0, weight=1)
 
         self.history_top_frame = ctk.CTkFrame(self.tab_history, fg_color="transparent")
         self.history_top_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 5))
-        self.history_top_frame.grid_columnconfigure(2, weight=1)
+        self.history_top_frame.grid_columnconfigure(3, weight=1)
 
         self.lbl_history_counter = ctk.CTkLabel(self.history_top_frame, text="Processed: 0/0 images", font=ctk.CTkFont(size=12, weight="bold"))
         self.lbl_history_counter.grid(row=0, column=0, padx=5, pady=5, sticky="w")
@@ -599,16 +716,37 @@ class BooruManagerApp(ctk.CTk):
         self.lbl_files_moved_hist = ctk.CTkLabel(self.history_top_frame, text="Files Moved This Session: 0", font=ctk.CTkFont(size=12, weight="bold"))
         self.lbl_files_moved_hist.grid(row=0, column=1, padx=15, pady=5, sticky="w")
 
-        self.switch_hide_unmatched = ctk.CTkSwitch(self.history_top_frame, text="Hide Unmatched Files", command=self.toggle_history_filter)
+        self.history_pagination_frame = ctk.CTkFrame(self.history_top_frame, fg_color="transparent")
+        self.history_pagination_frame.grid(row=0, column=2, padx=10, pady=2, sticky="w")
+
+        self.btn_prev_page = ctk.CTkButton(self.history_pagination_frame, text="◀ Prev", width=65, height=26, command=lambda: self.change_history_page(-1))
+        self.btn_prev_page.pack(side="left", padx=2)
+
+        self.lbl_page_indicator = ctk.CTkLabel(self.history_pagination_frame, text="Page 1/1", font=ctk.CTkFont(size=11))
+        self.lbl_page_indicator.pack(side="left", padx=5)
+
+        self.btn_next_page = ctk.CTkButton(self.history_pagination_frame, text="Next ▶", width=65, height=26, command=lambda: self.change_history_page(1))
+        self.btn_next_page.pack(side="left", padx=2)
+
+        self.switch_hide_unmatched = ctk.CTkSwitch(self.history_top_frame, text="Hide Unmatched Files", command=self.refresh_history_view)
+        self.switch_hide_unmatched.grid(row=0, column=3, padx=5, pady=5, sticky="e")
 
         self.history_scroll = ctk.CTkScrollableFrame(self.tab_history, fg_color="transparent")
         self.history_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self.history_scroll.grid_columnconfigure(0, weight=1)
 
-        self.history_items = []
-
         self.on_unmatched_change(self.opt_unmatched.get())
         self.load_settings()
+
+    def toggle_api_panel(self):
+        if self.api_panel_visible:
+            self.api_credentials_container.pack_forget()
+            self.btn_toggle_api_panel.configure(text="⚙️ Show API & Credentials Panel")
+            self.api_panel_visible = False
+        else:
+            self.api_credentials_container.pack(after=self.btn_toggle_api_panel, pady=(0, 5), padx=0, fill="x")
+            self.btn_toggle_api_panel.configure(text="⚙️ Hide API & Credentials Panel")
+            self.api_panel_visible = True
 
     def on_engine_change(self, choice):
         if choice == "Local Vision LLM" and not self.vision_warning_shown:
@@ -625,21 +763,54 @@ class BooruManagerApp(ctk.CTk):
         else:
             self.frame_tag_categories.pack_forget()
 
+    def on_use_embedded_tags_toggle(self):
+        if self.switch_use_embedded_tags.get() == 1:
+            self.switch_skip_no_embedded.pack(after=self.switch_use_embedded_tags, pady=(2, 6), padx=20, anchor="w")
+        else:
+            self.switch_skip_no_embedded.pack_forget()
+
     def update_progress_display(self, current, total):
         def _update():
             self.lbl_history_counter.configure(text=f"Processed: {current}/{total} images")
             self.title(f"Tag-AI {current}/{total}")
         self.after(0, _update)
 
-    def toggle_history_filter(self):
+    def get_filtered_history_items(self):
         hide = self.switch_hide_unmatched.get() == 1
-        for entry in self.history_items:
-            card = entry.get("card")
-            if card:
-                if hide and entry.get("is_unmatched", False):
-                    card.pack_forget()
-                else:
-                    card.pack(fill="x", pady=5, padx=5)
+        if hide:
+            return [e for e in self.history_items if not e.get("is_unmatched", False)]
+        return self.history_items
+
+    def change_history_page(self, delta):
+        filtered = self.get_filtered_history_items()
+        max_pages = max(1, (len(filtered) + self.history_per_page - 1) // self.history_per_page)
+        
+        new_page = self.history_page + delta
+        if 0 <= new_page < max_pages:
+            self.history_page = new_page
+            self.refresh_history_view()
+
+    def refresh_history_view(self):
+        for widget in self.history_scroll.winfo_children():
+            widget.destroy()
+
+        filtered = self.get_filtered_history_items()
+        total_items = len(filtered)
+        max_pages = max(1, (total_items + self.history_per_page - 1) // self.history_per_page)
+        
+        if self.history_page >= max_pages:
+            self.history_page = max_pages - 1
+
+        self.lbl_page_indicator.configure(text=f"Page {self.history_page + 1}/{max_pages}")
+
+        start_idx = self.history_page * self.history_per_page
+        end_idx = min(start_idx + self.history_per_page, total_items)
+
+        page_items = filtered[start_idx:end_idx]
+
+        for entry in page_items:
+            self.render_history_card(entry)
+
         self.update_metrics_display()
 
     def update_history_card_buttons(self):
@@ -715,10 +886,7 @@ class BooruManagerApp(ctk.CTk):
             if "btn_to_unmatched" in entry and entry["btn_to_unmatched"]:
                 entry["btn_to_unmatched"].pack_forget()
             
-            self.update_metrics_display()
-            
-            if self.switch_hide_unmatched.get() == 1:
-                card_frame.pack_forget()
+            self.refresh_history_view()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to move file to unmatched folder: {e}")
 
@@ -730,55 +898,80 @@ class BooruManagerApp(ctk.CTk):
 
         ext = os.path.splitext(curr)[1].lower()
         try:
-            img = Image.open(curr)
-            if ext == '.png':
-                img.save(curr)
-            elif ext in ['.jpg', '.jpeg']:
-                import piexif
-                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-                exif_bytes = piexif.dump(exif_dict)
-                img.save(curr, exif=exif_bytes, quality=95)
+            with Image.open(curr) as img:
+                if ext == '.png':
+                    img.save(curr)
+                elif ext in ['.jpg', '.jpeg']:
+                    import piexif
+                    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+                    exif_bytes = piexif.dump(exif_dict)
+                    img.save(curr, exif=exif_bytes, quality=95)
             
             self.log(f"Removed embedded metadata from {entry['filename']}")
             messagebox.showinfo("Success", f"Successfully removed embedded tags from {entry['filename']}.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to remove metadata: {e}")
 
-    def add_history_item(self, original_path, current_path, filename, is_unmatched=False, match_thumb_url=""):
+    def add_history_item(self, original_path, current_path, filename, is_unmatched=False, match_thumb_url="", match_url=""):
         entry = {
             "original_path": original_path,
             "current_path": current_path,
             "filename": filename,
             "is_unmatched": is_unmatched,
-            "match_thumb_url": match_thumb_url
+            "match_thumb_url": match_thumb_url,
+            "match_url": match_url
         }
         self.history_items.append(entry)
         
+        filtered = self.get_filtered_history_items()
+        max_pages = max(1, (len(filtered) + self.history_per_page - 1) // self.history_per_page)
+        self.history_page = max_pages - 1
+
+        def _refresh():
+            self.refresh_history_view()
+        self.after(0, _refresh)
+
+    def render_history_card(self, entry):
+        current_path = entry["current_path"]
+        filename = entry["filename"]
+        match_thumb_url = entry["match_thumb_url"]
+        match_url = entry.get("match_url", "")
+        is_unmatched = entry["is_unmatched"]
+
         card = ctk.CTkFrame(self.history_scroll, fg_color=("gray92", "gray18"))
         entry["card"] = card
-
-        if not (is_unmatched and self.switch_hide_unmatched.get() == 1):
-            card.pack(fill="x", pady=5, padx=5)
-            
+        card.pack(fill="x", pady=5, padx=5)
         card.grid_columnconfigure(2, weight=1)
 
-        thumb_lbl = ctk.CTkLabel(card, text="[No Image]", width=70, height=70, fg_color=("gray80", "gray30"))
+        thumb_lbl = ctk.CTkLabel(card, text="[No Image]", width=70, height=70, fg_color=("gray80", "gray30"), cursor="hand2")
         thumb_lbl.grid(row=0, column=0, rowspan=2, padx=(10, 5), pady=10)
+        thumb_lbl.bind("<Button-1>", lambda e, p=current_path: self.open_file_external(p))
         try:
-            pil_img = Image.open(current_path)
-            pil_img = pil_img.resize((70, 70))
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
-            thumb_lbl.configure(image=ctk_img, text="")
-            thumb_lbl.image = ctk_img
+            with Image.open(current_path) as pil_img:
+                pil_img = pil_img.resize((70, 70))
+                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
+                thumb_lbl.configure(image=ctk_img, text="")
+                thumb_lbl.image = ctk_img
         except Exception:
             pass
 
-        match_thumb_lbl = ctk.CTkLabel(card, text="[No Match]", width=70, height=70, fg_color=("gray80", "gray30"))
+        match_thumb_lbl = ctk.CTkLabel(
+            card, 
+            text="[No Match]" if not match_url else "[Artwork]", 
+            width=70, 
+            height=70, 
+            fg_color=("gray80", "gray30"),
+            cursor="hand2" if match_url else ""
+        )
         match_thumb_lbl.grid(row=0, column=1, rowspan=2, padx=(0, 10), pady=10)
+        
         if match_thumb_url:
-            threading.Thread(target=self.load_history_match_thumb_async, args=(match_thumb_url, match_thumb_lbl), daemon=True).start()
-        else:
-            match_thumb_lbl.configure(text="[Vision/AI]" if "Vision" in self.opt_engine.get() else "[No Match]")
+            threading.Thread(target=self.load_history_match_thumb_async, args=(match_thumb_url, match_thumb_lbl, match_url), daemon=True).start()
+        elif match_url:
+            match_thumb_lbl.configure(text="[Artwork]")
+
+        if match_url:
+            match_thumb_lbl.bind("<Button-1>", lambda e, u=match_url: webbrowser.open(u))
 
         info_text = f"File: {filename}\nMoved to: {os.path.dirname(current_path)}"
         info_lbl = ctk.CTkLabel(card, text=info_text, justify="left", font=ctk.CTkFont(size=11))
@@ -787,9 +980,6 @@ class BooruManagerApp(ctk.CTk):
 
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
         btn_frame.grid(row=1, column=2, sticky="sw", padx=5, pady=(0, 10))
-
-        open_btn = ctk.CTkButton(btn_frame, text="Open Image", width=85, height=28, fg_color="#3b5bdb", hover_color="#364fc7", command=lambda: self.open_file_external(current_path))
-        open_btn.pack(side="left", padx=(0, 5))
 
         folder_btn = ctk.CTkButton(btn_frame, text="Show in Folder", width=95, height=28, fg_color="#495057", hover_color="#343a40", command=lambda: self.open_folder_selected(current_path))
         folder_btn.pack(side="left", padx=(0, 5))
@@ -805,7 +995,7 @@ class BooruManagerApp(ctk.CTk):
         undo_btn = ctk.CTkButton(btn_frame, text="Undo Move", width=85, height=28, fg_color="#c92a2a", hover_color="#a61e1e", command=lambda: self.undo_move(entry, card))
         undo_btn.pack(side="left")
 
-    def load_history_match_thumb_async(self, url, lbl_widget):
+    def load_history_match_thumb_async(self, url, lbl_widget, match_url=""):
         if url.startswith("//"): url = "https:" + url
         elif url.startswith("/") and not url.startswith("//"): return
         try:
@@ -814,17 +1004,18 @@ class BooruManagerApp(ctk.CTk):
             elif "gelbooru" in url: headers['Referer'] = 'https://gelbooru.com/'
             elif "danbooru" in url.lower() or "donmai" in url.lower(): headers['Referer'] = 'https://danbooru.donmai.us/'
             elif "yande" in url: headers['Referer'] = 'https://yande.re/'
+            elif "pixiv" in url: headers['Referer'] = 'https://www.pixiv.net/'
 
             res = requests.get(url, headers=headers, timeout=5)
             if res.status_code == 200:
                 img_data = BytesIO(res.content)
-                pil_img = Image.open(img_data)
-                pil_img = pil_img.resize((70, 70))
-                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
-                def _apply():
-                    lbl_widget.configure(image=ctk_img, text="")
-                    lbl_widget.image = ctk_img
-                self.after(0, _apply)
+                with Image.open(img_data) as pil_img:
+                    pil_img = pil_img.resize((70, 70))
+                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
+                    def _apply():
+                        lbl_widget.configure(image=ctk_img, text="")
+                        lbl_widget.image = ctk_img
+                    self.after(0, _apply)
         except Exception:
             pass
 
@@ -846,14 +1037,13 @@ class BooruManagerApp(ctk.CTk):
                 self.update_metrics_display()
 
                 self.log(f"Undo: Moved {entry['filename']} back to {target_dir}")
-                card_frame.destroy()
                 if entry in self.history_items:
                     self.history_items.remove(entry)
+                self.refresh_history_view()
             except Exception as e:
                 messagebox.showerror("Undo Error", f"Failed to undo move: {e}")
         else:
             messagebox.showwarning("File Not Found", "The moved file no longer exists at its destination path.")
-            card_frame.destroy()
             if entry in self.history_items:
                 self.history_items.remove(entry)
             if entry.get("is_unmatched", False):
@@ -862,6 +1052,7 @@ class BooruManagerApp(ctk.CTk):
                 tracker.matched_files_moved = max(0, tracker.matched_files_moved - 1)
             tracker.files_moved = max(0, tracker.files_moved - 1)
             self.update_metrics_display()
+            self.refresh_history_view()
 
     def clear_app_cache(self):
         if messagebox.askyesno("Confirm Clear Cache", "Are you sure you want to clear the hash cache, API counters, console logs, and history?\n\nYour folders, toggles, and API keys will be preserved."):
@@ -870,35 +1061,28 @@ class BooruManagerApp(ctk.CTk):
             tracker.matched_files_moved = 0
             tracker.unmatched_files_moved = 0
             
-            tracker.iqdb_calls = 0
-            tracker.saucenao_calls = 0
-            tracker.danbooru_calls = 0
-            tracker.gelbooru_calls = 0
-            tracker.yandere_calls = 0
-            tracker.konachan_calls = 0
-            tracker.zerochan_calls = 0
-            tracker.serpapi_calls = 0
-            tracker.gvision_calls = 0
-            
-            tracker.iqdb_limiter.window_start = 0
+            tracker.iqdb_limiter.window_start = time.time()
             tracker.iqdb_limiter.window_calls = 0
+            tracker.danbooru_limiter.window_start = time.time()
+            tracker.danbooru_limiter.window_calls = 0
             for l in tracker.saucenao_limiter.limiters:
-                l["start"] = 0
+                l["start"] = time.time()
                 l["calls"] = 0
             tracker.gelbooru_limiter.last_call_time = 0
             tracker.yandere_limiter.last_call_time = 0
             tracker.konachan_limiter.last_call_time = 0
             tracker.zerochan_limiter.last_call_time = 0
+            tracker.pixiv_limiter.last_call_time = 0
 
-            for entry in self.history_items:
-                card = entry.get("card")
-                if card:
-                    card.destroy()
             self.history_items.clear()
+            self.history_page = 0
+            self.refresh_history_view()
             self.update_progress_display(0, 0)
 
-            self.txt_console.delete("0.0", "end")
-            self.txt_console.insert("0.0", "Cache, history, and counters cleared. System ready.\n")
+            self.txt_console_simp.delete("0.0", "end")
+            self.txt_console_simp.insert("0.0", "Cache, history, and counters cleared. System ready.\n")
+            self.txt_console_full.delete("0.0", "end")
+            self.txt_console_full.insert("0.0", "Cache, history, and counters cleared. System ready.\n")
 
             self.update_metrics_display()
             self.save_settings()
@@ -922,6 +1106,8 @@ class BooruManagerApp(ctk.CTk):
             "skip_on_web_fail": self.switch_skip_on_web_fail.get(),
             "vision_warning_shown": self.vision_warning_shown,
             "scan_subfolders": self.switch_scan_subfolders.get(),
+            "use_embedded_tags": self.switch_use_embedded_tags.get(),
+            "skip_no_embedded": self.switch_skip_no_embedded.get(),
             "embed_metadata": self.switch_embed_metadata.get(),
             "meta_artist": self.switch_meta_artist.get(),
             "meta_series": self.switch_meta_series.get(),
@@ -934,17 +1120,8 @@ class BooruManagerApp(ctk.CTk):
             "gb_key": self.ent_gb_key.get(),
             "skey": self.ent_skey.get(),
             "lm_url": self.ent_lm.get(),
-            "tracker": {
-                "iqdb": tracker.iqdb_calls,
-                "saucenao": tracker.saucenao_calls,
-                "danbooru": tracker.danbooru_calls,
-                "gelbooru": tracker.gelbooru_calls,
-                "yandere": tracker.yandere_calls,
-                "konachan": tracker.konachan_calls,
-                "zerochan": tracker.zerochan_calls,
-                "serpapi": tracker.serpapi_calls,
-                "gvision": tracker.gvision_calls
-            }
+            "serpapi_counter": tracker.serpapi_calls,
+            "gvision_counter": tracker.gvision_calls
         }
         try:
             with open(self.config_file, 'w') as f:
@@ -1003,6 +1180,13 @@ class BooruManagerApp(ctk.CTk):
             if config.get("scan_subfolders", 0): self.switch_scan_subfolders.select()
             else: self.switch_scan_subfolders.deselect()
 
+            if config.get("use_embedded_tags", 0): self.switch_use_embedded_tags.select()
+            else: self.switch_use_embedded_tags.deselect()
+            self.on_use_embedded_tags_toggle()
+
+            if config.get("skip_no_embedded", 0): self.switch_skip_no_embedded.select()
+            else: self.switch_skip_no_embedded.deselect()
+
             if config.get("embed_metadata", 0): self.switch_embed_metadata.select()
             else: self.switch_embed_metadata.deselect()
             self.on_embed_metadata_toggle()
@@ -1050,16 +1234,8 @@ class BooruManagerApp(ctk.CTk):
             self.ent_lm.delete(0, 'end')
             self.ent_lm.insert(0, config.get("lm_url", "http://localhost:1234/v1"))
             
-            t_data = config.get("tracker", {})
-            tracker.iqdb_calls = t_data.get("iqdb", 0)
-            tracker.saucenao_calls = t_data.get("saucenao", 0)
-            tracker.danbooru_calls = t_data.get("danbooru", 0)
-            tracker.gelbooru_calls = t_data.get("gelbooru", 0)
-            tracker.yandere_calls = t_data.get("yandere", 0)
-            tracker.konachan_calls = t_data.get("konachan", 0)
-            tracker.zerochan_calls = t_data.get("zerochan", 0)
-            tracker.serpapi_calls = t_data.get("serpapi", 0)
-            tracker.gvision_calls = t_data.get("gvision", 0)
+            tracker.serpapi_calls = config.get("serpapi_counter", 0)
+            tracker.gvision_calls = config.get("gvision_counter", 0)
             self.update_metrics_display()
             
             self.on_unmatched_change(self.opt_unmatched.get())
@@ -1101,18 +1277,18 @@ class BooruManagerApp(ctk.CTk):
     def on_unmatched_change(self, choice):
         if "Move" in choice:
             self.btn_select_unmatched.configure(state="normal")
-            self.switch_hide_unmatched.grid(row=0, column=2, padx=5, pady=5, sticky="e")
+            self.switch_hide_unmatched.grid(row=0, column=3, padx=5, pady=5, sticky="e")
         else:
             self.btn_select_unmatched.configure(state="disabled")
             self.switch_hide_unmatched.grid_remove()
             self.switch_hide_unmatched.deselect()
-            self.toggle_history_filter()
+            self.refresh_history_view()
         self.update_history_card_buttons()
 
     def update_metrics_display(self):
         def _update():
             self.lbl_iqdb_metric.configure(text=f"IQDB: {tracker.iqdb_calls} (Limit: {tracker.IQDB_LIMIT})")
-            self.lbl_saucenao_metric.configure(text=f"SauceNAO: {tracker.saucenao_calls} (Limit: {tracker.SAUCENAO_LIMIT})")
+            self.lbl_saucenao_metric.configure(text=f"SauceNAO: {tracker.saucenao_status} (Limit: {tracker.SAUCENAO_LIMIT})")
             self.lbl_danbooru_metric.configure(text=f"Danbooru: {tracker.danbooru_calls} (Limit: {tracker.DANBOORU_LIMIT})")
             self.lbl_gelbooru_metric.configure(text=f"Gelbooru: {tracker.gelbooru_calls} (Limit: {tracker.GELBOORU_LIMIT})")
             self.lbl_yandere_metric.configure(text=f"Yande.re: {tracker.yandere_calls} (Limit: {tracker.YANDERE_LIMIT})")
@@ -1156,21 +1332,31 @@ class BooruManagerApp(ctk.CTk):
             self.lbl_unmatched_val.configure(text=f"...{os.path.basename(folder)}")
             self.log(f"Unmatched destination updated to: {folder}")
 
-    def log(self, message):
+    def log(self, message, full_only=False):
         def _log():
-            self.txt_console.insert("end", message + "\n")
-            self.txt_console.see("end")
+            if not full_only:
+                self.txt_console_simp.insert("end", message + "\n")
+                lc_simp = int(self.txt_console_simp.index('end-1c').split('.')[0])
+                if lc_simp > 1000:
+                    self.txt_console_simp.delete("1.0", "2.0")
+                self.txt_console_simp.see("end")
+
+            self.txt_console_full.insert("end", message + "\n")
+            lc_full = int(self.txt_console_full.index('end-1c').split('.')[0])
+            if lc_full > 1000:
+                self.txt_console_full.delete("1.0", "2.0")
+            self.txt_console_full.see("end")
         self.after(0, _log)
 
     def load_local_thumbnail(self, file_path):
         try:
-            pil_img = Image.open(file_path)
-            pil_img = pil_img.resize((110, 110))
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(110, 110))
-            def _apply():
-                self.lbl_source_thumb.configure(image=ctk_img, text="")
-                self.lbl_source_thumb.image = ctk_img
-            self.after(0, _apply)
+            with Image.open(file_path) as pil_img:
+                pil_img = pil_img.resize((110, 110))
+                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(110, 110))
+                def _apply():
+                    self.lbl_source_thumb.configure(image=ctk_img, text="")
+                    self.lbl_source_thumb.image = ctk_img
+                self.after(0, _apply)
         except Exception:
             self.after(0, lambda: self.lbl_source_thumb.configure(text="[Load Error]", image=""))
 
@@ -1180,25 +1366,24 @@ class BooruManagerApp(ctk.CTk):
         elif url.startswith("/") and not url.startswith("//"): return
         
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             if "zerochan" in url: headers['Referer'] = 'https://www.zerochan.net/'
             elif "gelbooru" in url: headers['Referer'] = 'https://gelbooru.com/'
             elif "danbooru" in url.lower() or "donmai" in url.lower(): headers['Referer'] = 'https://danbooru.donmai.us/'
             elif "yande" in url: headers['Referer'] = 'https://yande.re/'
+            elif "pixiv" in url: headers['Referer'] = 'https://www.pixiv.net/'
             
             response = requests.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
                 img_data = BytesIO(response.content)
-                pil_img = Image.open(img_data)
-                pil_img = pil_img.resize((110, 110))
-                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(110, 110))
-                
-                def _apply():
-                    self.lbl_match_thumb.configure(image=ctk_img, text="")
-                    self.lbl_match_thumb.image = ctk_img
-                self.after(0, _apply)
+                with Image.open(img_data) as pil_img:
+                    pil_img = pil_img.resize((110, 110))
+                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(110, 110))
+                    
+                    def _apply():
+                        self.lbl_match_thumb.configure(image=ctk_img, text="")
+                        self.lbl_match_thumb.image = ctk_img
+                    self.after(0, _apply)
             else:
                 def _show_err():
                     if getattr(self.lbl_match_thumb, "image", None) is None:
@@ -1218,32 +1403,33 @@ class BooruManagerApp(ctk.CTk):
 
         self.save_settings()
 
-        mode = self.opt_exec_mode.get()
-        if "Folder" in mode and os.path.exists(self.target_source):
-            batch_files = [f for f in os.listdir(self.target_source) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
-            if len(batch_files) > 25 and "Local Vision" not in self.opt_engine.get():
-                proceed = messagebox.askyesno(
-                    "Rate Limit Warning", 
-                    f"Folder contains {len(batch_files)} images.\n"
-                    "Automated pacing delays will be applied to prevent IP throttling.\n"
-                    "Proceed with execution?"
-                )
-                if not proceed: return
-
         self.is_processing = True
         self.stop_requested = False
         self.skip_requested = False
         self.btn_start.configure(state="disabled", fg_color="gray")
         self.btn_skip.configure(state="normal", fg_color="#e67700")
-        self.btn_cancel.configure(state="normal", fg_color="#c92a2a")
+        self.btn_cancel.configure(state="normal", text="Cancel Execution", fg_color="#c92a2a")
         threading.Thread(target=self.run_workflow, daemon=True).start()
 
     def cancel_processing(self):
         if self.is_processing:
-            self.stop_requested = True
-            self.log("\n[User Interrupt] Stop requested. Canceling after current item finishes...")
-            self.btn_cancel.configure(state="disabled", fg_color="gray")
-            self.btn_skip.configure(state="disabled", fg_color="gray")
+            if not self.stop_requested:
+                self.stop_requested = True
+                self.log("\n[User Interrupt] Stop requested. Execution will halt shortly...")
+                self.btn_cancel.configure(text="Cancelling...", fg_color="#a61e1e")
+            else:
+                self.log("\n[User Interrupt] Force-abort triggered. Resetting application state...")
+                self.is_processing = False
+                self.file_in_progress = False
+                self.stop_requested = False
+                self.skip_requested = False
+                def _reset_force():
+                    self.btn_start.configure(state="normal", fg_color="#2b8a3e")
+                    self.btn_skip.configure(state="disabled", fg_color="gray")
+                    self.btn_cancel.configure(state="disabled", text="Cancel Execution", fg_color="#c92a2a")
+                    self.title("Tag-AI Booru Image Sorter")
+                    self.lbl_details.configure(text="Status: Execution canceled immediately.")
+                self.after(0, _reset_force)
 
     def skip_current_file_action(self):
         if self.is_processing and self.file_in_progress:
@@ -1255,9 +1441,19 @@ class BooruManagerApp(ctk.CTk):
         for attempt in range(1, retries + 1):
             if self.skip_requested or self.stop_requested: return None
             try:
-                return requests.get(url, headers=headers, auth=auth, timeout=timeout)
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                if attempt < retries: time.sleep(1.0 * attempt)
+                res = requests.get(url, headers=headers, auth=auth, timeout=timeout)
+                if res.status_code != 200:
+                    self.log(f"  [API Error] HTTP {res.status_code} for {url.split('?')[0]} ({res.reason})", full_only=False)
+                return res
+            except requests.exceptions.Timeout as te:
+                self.log(f"  [API Timeout] Request timed out ({url.split('?')[0]}): {te}", full_only=False)
+            except requests.exceptions.ConnectionError as ce:
+                self.log(f"  [API Connection Error] Failed to connect ({url.split('?')[0]}): {ce}", full_only=False)
+            except Exception as ex:
+                self.log(f"  [API Exception] {url.split('?')[0]}: {ex}", full_only=False)
+            
+            if attempt < retries:
+                time.sleep(1.0 * attempt)
         return None
 
     def search_iqdb_engine(self, file_path, is_fallback=False):
@@ -1267,7 +1463,7 @@ class BooruManagerApp(ctk.CTk):
             return []
         self.update_metrics_display()
 
-        booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None}
+        booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None, 'pixiv': None}
         primary_title, best_thumb = "", ""
         max_similarity = 0.0
 
@@ -1278,6 +1474,7 @@ class BooruManagerApp(ctk.CTk):
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
                 for table in soup.find_all('table'):
+                    if self.stop_requested or self.skip_requested: break
                     table_text = table.get_text()
                     pct_matches = re.findall(r'(\d+(?:\.\d+)?)\s*%', table_text)
                     if not pct_matches: continue
@@ -1286,7 +1483,7 @@ class BooruManagerApp(ctk.CTk):
                     except: continue
 
                     if table_sim < 75.0:
-                        self.log(f"  [IQDB Filter] Rejected table match due to low confidence ({table_sim:.1f}%).")
+                        self.log(f"  [IQDB] Ignored low-similarity match ({table_sim:.1f}% < 75.0%)", full_only=True)
                         continue
 
                     if table_sim > max_similarity:
@@ -1324,11 +1521,26 @@ class BooruManagerApp(ctk.CTk):
                                 if z_id.isdigit(): booru_ids['zerochan'] = z_id
                             except: pass
                             if not primary_title: primary_title = href
+                        elif 'pixiv.net' in href and not booru_ids['pixiv']:
+                            m = re.search(r'illust_id=(\d+)', href) or re.search(r'/artworks/(\d+)', href)
+                            if m: booru_ids['pixiv'] = m.group(1)
+                            if not primary_title: primary_title = href
+
+            else:
+                self.log(f"  [IQDB Error] HTTP {res.status_code} ({res.reason})", full_only=False)
 
             if max_similarity >= 75.0 and (any(booru_ids.values()) or primary_title):
-                return [{'engine': 'IQDB', 'title': primary_title, 'similarity': max_similarity, 'booru_ids': booru_ids, 'thumb': best_thumb}]
+                return [{
+                    'engine': 'IQDB',
+                    'title': primary_title,
+                    'similarity': max_similarity,
+                    'booru_ids': booru_ids,
+                    'thumb': best_thumb,
+                    'fallback_url': primary_title
+                }]
         except Exception as e:
-            self.log(f"  [IQDB Error]: {e}")
+            if not self.stop_requested:
+                self.log(f"  [IQDB Error] {e}", full_only=False)
         return []
 
     def search_saucenao_engine(self, file_path, api_key, is_fallback=False):
@@ -1338,8 +1550,8 @@ class BooruManagerApp(ctk.CTk):
             return []
         self.update_metrics_display()
 
-        booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None}
-        primary_title, best_thumb = "", ""
+        booru_ids = {'danbooru': None, 'gelbooru': None, 'yandere': None, 'konachan': None, 'zerochan': None, 'pixiv': None}
+        primary_title, best_thumb, fallback_ext_url = "", "", ""
         max_similarity = 0.0
 
         try:
@@ -1350,11 +1562,15 @@ class BooruManagerApp(ctk.CTk):
             if res.status_code == 200:
                 results = res.json().get('results', [])
                 for r in results:
+                    if self.stop_requested or self.skip_requested: break
                     data = r.get('data', {})
                     header = r.get('header', {})
                     
                     try:
                         sim_val = float(header.get('similarity', 0))
+                        if sim_val < 75.0:
+                            self.log(f"  [SauceNAO] Ignored low-similarity match ({sim_val:.1f}% < 75.0%)", full_only=True)
+                            continue
                         if sim_val > max_similarity:
                             max_similarity = sim_val
                             best_thumb = header.get('thumbnail', '')
@@ -1366,55 +1582,62 @@ class BooruManagerApp(ctk.CTk):
                     if data.get('gelbooru_id'): booru_ids['gelbooru'] = str(data.get('gelbooru_id'))
                     if data.get('yandere_id'): booru_ids['yandere'] = str(data.get('yandere_id'))
                     if data.get('konachan_id'): booru_ids['konachan'] = str(data.get('konachan_id'))
+                    if data.get('pixiv_id'): booru_ids['pixiv'] = str(data.get('pixiv_id'))
 
                     for url in data.get('ext_urls', []):
+                        if not fallback_ext_url: fallback_ext_url = url
                         if 'zerochan.net' in url and not booru_ids['zerochan']:
                             z_id = url.split('/')[-1]
                             if z_id.isdigit(): booru_ids['zerochan'] = z_id
+                        elif 'pixiv.net' in url and not booru_ids['pixiv']:
+                            m = re.search(r'illust_id=(\d+)', url) or re.search(r'/artworks/(\d+)', url)
+                            if m: booru_ids['pixiv'] = m.group(1)
 
-                if any(booru_ids.values()) or primary_title:
-                    return [{'engine': 'SauceNAO', 'title': primary_title, 'similarity': max_similarity, 'booru_ids': booru_ids, 'thumb': best_thumb}]
+                if max_similarity >= 75.0 and (any(booru_ids.values()) or primary_title or fallback_ext_url):
+                    return [{
+                        'engine': 'SauceNAO',
+                        'title': primary_title,
+                        'similarity': max_similarity,
+                        'booru_ids': booru_ids,
+                        'thumb': best_thumb,
+                        'fallback_url': fallback_ext_url
+                    }]
+            else:
+                self.log(f"  [SauceNAO Error] HTTP {res.status_code} ({res.reason}) - {res.text[:80]}", full_only=False)
         except Exception as e:
-            self.log(f"  [SauceNAO Error]: {e}")
+            if not self.stop_requested:
+                self.log(f"  [SauceNAO Error] {e}", full_only=False)
         return []
 
     def search_local_vision_engine(self, file_path, client, model_id):
-        self.log("  [Local Vision LLM] Analyzing image with vision model...")
-        def _set_vision_status():
-            self.lbl_match_thumb.configure(text="[Vision AI]", image="")
-            self.lbl_match_thumb.image = None
-            self.lbl_details.configure(text=f"File: {os.path.basename(file_path)}\nStatus: Querying Local Vision LLM...")
-        self.after(0, _set_vision_status)
+        self.log(f"  [Local Vision LLM] Analyzing {os.path.basename(file_path)}...")
         
         try:
             web_context = ""
             web_api_enabled_count = 0
 
-            # 1. Try SerpApi if enabled
             if self.switch_serpapi.get() == 1:
                 serpapi_key = self.ent_serpapi_key.get().strip()
-                if serpapi_key:
+                if serpapi_key and not self.stop_requested:
                     web_api_enabled_count += 1
                     web_context = fetch_google_lens_context(file_path, serpapi_key, self.log)
                     tracker.serpapi_calls += 1
                     self.update_metrics_display()
 
-            if self.skip_requested: return []
+            if self.skip_requested or self.stop_requested: return []
 
-            # 2. Try Google Cloud Vision API if SerpApi didn't run/succeed and Google Vision is enabled
             if not web_context and self.switch_gvision.get() == 1:
                 gvision_key = self.ent_gvision_key.get().strip()
-                if gvision_key:
+                if gvision_key and not self.stop_requested:
                     web_api_enabled_count += 1
                     web_context = fetch_google_vision_web_detection(file_path, gvision_key, self.log)
                     tracker.gvision_calls += 1
                     self.update_metrics_display()
 
-            if self.skip_requested: return []
+            if self.skip_requested or self.stop_requested: return []
 
-            # Check if web search APIs were enabled/configured but failed to find any results
             if web_api_enabled_count > 0 and not web_context and self.switch_skip_on_web_fail.get() == 1:
-                self.log("  [Web Search] Enabled web search API(s) returned no results or failed. Skipping local vision tagging (Treating as Unmatched).")
+                self.log("  [Web Search] Enabled web search API(s) returned no results or failed. Skipping local vision tagging.", full_only=False)
                 return []
 
             with open(file_path, "rb") as image_file:
@@ -1450,6 +1673,8 @@ class BooruManagerApp(ctk.CTk):
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"}}
             ]
 
+            if self.stop_requested: return []
+
             response = client.chat.completions.create(
                 model=model_id,
                 messages=[
@@ -1460,6 +1685,7 @@ class BooruManagerApp(ctk.CTk):
                 max_tokens=500
             )
             raw_res = response.choices[0].message.content.strip()
+
             if raw_res.startswith("```"):
                 raw_res = raw_res.split("```")[1]
                 if raw_res.startswith("json") or raw_res.startswith("text"):
@@ -1476,12 +1702,11 @@ class BooruManagerApp(ctk.CTk):
                 }
                 combined_list = [v for v in cat_tag_dict.values() if v]
                 cat_tag_dict['combined'] = " ".join(combined_list).strip()
-            except Exception:
+            except Exception as parse_err:
                 norm_str = normalize_tag(raw_res)
                 cat_tag_dict = {'artist': '', 'copyright': '', 'character': '', 'general': norm_str, 'meta': '', 'combined': norm_str}
 
             if cat_tag_dict['combined']:
-                self.log(f"  [Local Vision LLM SUCCESS] Generated {len(cat_tag_dict['combined'].split())} tags!")
                 return [{
                     'engine': 'Local Vision LLM',
                     'title': 'Local Vision AI Tags',
@@ -1491,15 +1716,16 @@ class BooruManagerApp(ctk.CTk):
                     'tag_dict_override': cat_tag_dict
                 }]
         except Exception as e:
-            self.log(f"  [Local Vision LLM Error]: {e}")
+            if not self.stop_requested:
+                self.log(f"  [Local Vision LLM Error] {e}", full_only=False)
         return []
 
     def fetch_tags(self, file_path, match_meta, primary_choice, db_user, db_key, gb_user, gb_key):
-        tag_data = {'artist': '', 'copyright': '', 'character': '', 'general': '', 'meta': '', 'combined': ''}
+        tag_data = {'artist': '', 'copyright': '', 'character': '', 'general': '', 'meta': '', 'combined': '', 'matched_url': ''}
         booru_ids = match_meta.get('booru_ids', {}) if match_meta else {}
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         db_headers = {'User-Agent': f"TagAIBooruSorter/1.0 (by {db_user if db_user else 'anonymous_user'})"}
-        confidence_order = ["danbooru", "yandere", "gelbooru", "konachan", "zerochan"]
+        confidence_order = ["danbooru", "yandere", "gelbooru", "konachan", "zerochan", "pixiv"]
 
         target_key = None
         if "Danbooru" in primary_choice: target_key = "danbooru"
@@ -1507,6 +1733,7 @@ class BooruManagerApp(ctk.CTk):
         elif "Gelbooru" in primary_choice: target_key = "gelbooru"
         elif "Konachan" in primary_choice: target_key = "konachan"
         elif "Zerochan" in primary_choice: target_key = "zerochan"
+        elif "Pixiv" in primary_choice: target_key = "pixiv"
 
         if target_key and target_key in confidence_order:
             confidence_order.remove(target_key)
@@ -1517,14 +1744,12 @@ class BooruManagerApp(ctk.CTk):
             ident = booru_ids.get(source)
             if not ident: continue
             
-            db_display_name = {"danbooru": "Danbooru", "yandere": "Yande.re", "gelbooru": "Gelbooru", "konachan": "Konachan", "zerochan": "Zerochan"}.get(source, source.capitalize())
+            db_display_name = {"danbooru": "Danbooru", "yandere": "Yande.re", "gelbooru": "Gelbooru", "konachan": "Konachan", "zerochan": "Zerochan", "pixiv": "Pixiv"}.get(source, source.capitalize())
 
             try:
                 if source == 'danbooru':
                     tracker.danbooru_limiter.record(self.log)
                     self.update_metrics_display()
-                    status_msg = f"Querying {db_display_name}...\nID: {ident}"
-                    self.after(0, lambda msg=status_msg: self.lbl_details.configure(text=msg))
                     self.log(f"  Querying Danbooru ID: {ident}...")
                     auth = (db_user, db_key) if (db_user and db_key) else None
                     res = self.safe_get_request(f"https://danbooru.donmai.us/posts/{ident}.json", headers=db_headers, auth=auth, timeout=6)
@@ -1539,28 +1764,12 @@ class BooruManagerApp(ctk.CTk):
                         tag_data['general'] = normalize_tag(pdata.get('tag_string_general', ''))
                         tag_data['meta'] = normalize_tag(pdata.get('tag_string_meta', ''))
                         tag_data['combined'] = normalize_tag(pdata.get('tag_string', ''))
+                        tag_data['matched_url'] = f"https://danbooru.donmai.us/posts/{ident}"
                         
                         if tag_data['combined']:
-                            self.log(f"  [{db_display_name} API SUCCESS] Retrieved {len(tag_data['combined'].split())} tags!")
-                            match_msg = f"Match Found\n({db_display_name} ID: {ident})"
-                            self.after(0, lambda msg=match_msg: self.lbl_details.configure(text=msg))
                             return tag_data
-                    else:
-                        self.log("  [Danbooru API Failed] Attempting HTML scraping fallback...")
-                        res_html = self.safe_get_request(f"https://danbooru.donmai.us/posts/{ident}", headers=db_headers, timeout=6)
-                        if res_html and res_html.status_code == 200:
-                            soup = BeautifulSoup(res_html.text, 'html.parser')
-                            tag_elements = soup.find_all('a', class_='search-tag')
-                            if tag_elements:
-                                raw_str = normalize_tag(" ".join([a.text.strip() for a in tag_elements]))
-                                tag_data['general'] = raw_str
-                                tag_data['combined'] = raw_str
-                                self.log(f"  [{db_display_name} Scraping SUCCESS] Retrieved {len(raw_str.split())} tags!")
-                                match_msg = f"Match Found\n({db_display_name} ID: {ident})"
-                                self.after(0, lambda msg=match_msg: self.lbl_details.configure(text=msg))
-                                return tag_data
 
-                elif source in ['yandere', 'konachan', 'gelbooru', 'zerochan']:
+                elif source in ['yandere', 'konachan', 'gelbooru', 'zerochan', 'pixiv']:
                     if source == 'yandere':
                         tracker.yandere_limiter.record(self.log)
                         url = f"https://yande.re/post.json?tags=id:{ident}"
@@ -1571,16 +1780,21 @@ class BooruManagerApp(ctk.CTk):
                         tracker.gelbooru_limiter.record(self.log)
                         auth_params = f"&api_key={gb_key}&user_id={gb_user}" if (gb_user and gb_key) else ""
                         url = f"https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&id={ident}{auth_params}"
-                    else:
+                    elif source == 'zerochan':
                         tracker.zerochan_limiter.record(self.log)
                         url = f"https://www.zerochan.net/{ident}?json"
+                    else:
+                        tracker.pixiv_limiter.record(self.log)
+                        url = f"https://www.pixiv.net/ajax/illust/{ident}"
 
                     self.update_metrics_display()
-                    status_msg = f"Querying {db_display_name}...\nID: {ident}"
-                    self.after(0, lambda msg=status_msg: self.lbl_details.configure(text=msg))
                     self.log(f"  Querying {db_display_name} ID: {ident}...")
                     
-                    res = self.safe_get_request(url, headers=headers, timeout=6)
+                    req_headers = headers.copy()
+                    if source == 'pixiv':
+                        req_headers['Referer'] = f"https://www.pixiv.net/artworks/{ident}"
+
+                    res = self.safe_get_request(url, headers=req_headers, timeout=6)
                     if res and res.status_code == 200:
                         if source == 'zerochan':
                             pdata = res.json()
@@ -1591,8 +1805,26 @@ class BooruManagerApp(ctk.CTk):
                                 raw_str = normalize_tag(" ".join(tags_list))
                                 tag_data['general'] = raw_str
                                 tag_data['combined'] = raw_str
-                                self.log(f"  [{db_display_name} SUCCESS] Retrieved {len(tags_list)} tags!")
+                                tag_data['matched_url'] = f"https://www.zerochan.net/{ident}"
                                 return tag_data
+                        elif source == 'pixiv':
+                            pdata = res.json()
+                            if not pdata.get('error'):
+                                body = pdata.get('body', {})
+                                preview_url = body.get('urls', {}).get('regular') or body.get('urls', {}).get('small')
+                                if preview_url: self.update_match_thumbnail(preview_url)
+                                
+                                artist_name = body.get('userName', '')
+                                if artist_name: tag_data['artist'] = normalize_tag(artist_name)
+                                
+                                tags_obj = body.get('tags', {}).get('tags', [])
+                                tag_names = [t.get('tag') for t in tags_obj if t.get('tag')]
+                                if tag_names:
+                                    raw_str = normalize_tag(" ".join(tag_names))
+                                    tag_data['general'] = raw_str
+                                    tag_data['combined'] = raw_str
+                                    tag_data['matched_url'] = f"https://www.pixiv.net/artworks/{ident}"
+                                    return tag_data
                         else:
                             data = res.json()
                             posts = data.get('post', []) if isinstance(data, dict) and source == 'gelbooru' else data
@@ -1605,9 +1837,19 @@ class BooruManagerApp(ctk.CTk):
                                 if t_str:
                                     tag_data['general'] = t_str
                                     tag_data['combined'] = t_str
-                                    self.log(f"  [{db_display_name} SUCCESS] Retrieved {len(t_str.split())} tags!")
+                                    if source == 'yandere':
+                                        tag_data['matched_url'] = f"https://yande.re/post/show/{ident}"
+                                    elif source == 'konachan':
+                                        tag_data['matched_url'] = f"https://konachan.com/post/show/{ident}"
+                                    elif source == 'gelbooru':
+                                        tag_data['matched_url'] = f"https://gelbooru.com/index.php?page=post&s=view&id={ident}"
                                     return tag_data
-            except: pass
+            except Exception as e:
+                if not self.stop_requested:
+                    self.log(f"  [{db_display_name} Error] {e}", full_only=False)
+
+        if not tag_data['matched_url'] and match_meta and match_meta.get('fallback_url'):
+            tag_data['matched_url'] = match_meta.get('fallback_url')
 
         return tag_data
 
@@ -1633,337 +1875,362 @@ class BooruManagerApp(ctk.CTk):
 
         ext = os.path.splitext(file_path)[1].lower()
         try:
-            img = Image.open(file_path)
-            if ext == '.png':
-                metadata = PngImagePlugin.PngInfo()
-                metadata.add_text("parameters", final_string)
-                metadata.add_text("booru_tags", final_string)
-                img.save(file_path, pnginfo=metadata)
-            elif ext in ['.jpg', '.jpeg']:
-                try:
-                    import piexif
-                    from piexif.helper import UserComment
-                    
-                    comment_bytes = UserComment.dump(final_string, encoding="unicode")
-                    exif_dict = {"0th": {}, "Exif": {piexif.ExifIFD.UserComment: comment_bytes}, "GPS": {}, "1st": {}, "thumbnail": None}
-                    exif_bytes = piexif.dump(exif_dict)
-                    
-                    img.save(file_path, exif=exif_bytes, quality=95)
-                except ImportError:
-                    self.log("  [Metadata Error] 'piexif' library not installed. Run 'pip install piexif'.")
-                    img.save(file_path, quality=95)
-                except Exception as ex_err:
-                    self.log(f"  [Metadata Error] Failed to write JPEG EXIF: {ex_err}")
-                    img.save(file_path, quality=95)
-            
-            self.log(f"  [Metadata] Successfully embedded tags into {os.path.basename(file_path)}")
-        except Exception as e:
-            self.log(f"  [Metadata Error]: {e}")
+            with Image.open(file_path) as img:
+                if ext == '.png':
+                    metadata = PngImagePlugin.PngInfo()
+                    metadata.add_text("parameters", final_string)
+                    metadata.add_text("booru_tags", final_string)
+                    img.save(file_path, pnginfo=metadata)
+                elif ext in ['.jpg', '.jpeg']:
+                    try:
+                        import piexif
+                        from piexif.helper import UserComment
+                        
+                        comment_bytes = UserComment.dump(final_string, encoding="unicode")
+                        exif_dict = {"0th": {}, "Exif": {piexif.ExifIFD.UserComment: comment_bytes}, "GPS": {}, "1st": {}, "thumbnail": None}
+                        exif_bytes = piexif.dump(exif_dict)
+                        
+                        img.save(file_path, exif=exif_bytes, quality=95)
+                    except Exception:
+                        img.save(file_path, quality=95)
+        except Exception:
+            pass
 
     def run_workflow(self):
-        lm_url = self.ent_lm.get().strip()
-        engine_choice = self.opt_engine.get()
-        tag_choice = self.opt_tags.get()
-        exec_mode = self.opt_exec_mode.get()
-        saucenao_key = self.ent_skey.get().strip()
-        db_user = self.ent_db_user.get().strip()
-        db_key = self.ent_db_key.get().strip()
-        gb_user = self.ent_gb_user.get().strip()
-        gb_key = self.ent_gb_key.get().strip()
-        allow_engine_fallback = bool(self.switch_engine_fallback.get())
-        allow_vision_fallback = bool(self.switch_vision_fallback.get())
-
-        image_files = []
-        if "Single" in exec_mode:
-            if os.path.exists(self.target_source): image_files = [self.target_source]
-        else:
-            if os.path.exists(self.target_source):
-                image_files = [os.path.join(self.target_source, f) for f in os.listdir(self.target_source) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
-
-        if not image_files:
-            self.log("Error: No valid image files found at target source path.")
-            self.is_processing = False
-            def _reset_early():
-                self.btn_start.configure(state="normal", fg_color="#2b8a3e")
-                self.btn_skip.configure(state="disabled", fg_color="gray")
-                self.btn_cancel.configure(state="disabled", fg_color="gray")
-                self.title("Tag-AI Booru Image Sorter")
-            self.after(0, _reset_early)
-            return
-
-        self.log(f"\n--- Connecting to Local LLM Base URL at {lm_url} ---")
-        client = OpenAI(base_url=lm_url, api_key="lm-studio")
         try:
-            models = client.models.list()
-            model_id = models.data[0].id
-            self.log(f"Connected! Active model loaded: {model_id}")
-        except Exception as e:
-            self.log(f"Warning: Could not fetch models list. Using fallback ID.")
-            model_id = "local-model"
+            lm_url = self.ent_lm.get().strip()
+            engine_choice = self.opt_engine.get()
+            tag_choice = self.opt_tags.get()
+            exec_mode = self.opt_exec_mode.get()
+            saucenao_key = self.ent_skey.get().strip()
+            db_user = self.ent_db_user.get().strip()
+            db_key = self.ent_db_key.get().strip()
+            gb_user = self.ent_gb_user.get().strip()
+            gb_key = self.ent_gb_key.get().strip()
+            allow_engine_fallback = bool(self.switch_engine_fallback.get())
+            allow_vision_fallback = bool(self.switch_vision_fallback.get())
+            use_embedded = bool(self.switch_use_embedded_tags.get() == 1)
+            skip_no_embedded = bool(self.switch_skip_no_embedded.get() == 1)
 
-        total_files = len(image_files)
-        self.log(f"Starting execution of {total_files} item(s) in [{exec_mode}]...")
+            image_files = []
+            if "Single" in exec_mode:
+                if os.path.exists(self.target_source): image_files = [self.target_source]
+            else:
+                if os.path.exists(self.target_source):
+                    image_files = [os.path.join(self.target_source, f) for f in os.listdir(self.target_source) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
 
-        for idx, file_path in enumerate(image_files, 1):
-            if self.stop_requested: break
-            self.skip_requested = False
-            self.file_in_progress = True
-            
-            # Watchdog thread to check if file processing takes > 60 seconds
-            file_start_time = time.time()
-            stuck_warning_logged = [False]
-            def check_stuck():
-                while self.is_processing and self.file_in_progress and not self.skip_requested and not self.stop_requested:
-                    if time.time() - file_start_time > 60 and not stuck_warning_logged[0]:
-                        stuck_warning_logged[0] = True
-                        self.log(f"  [Warning] Current file '{os.path.basename(file_path)}' has been stuck for over a minute! Click 'Skip Current File' if unresponsive.")
-                        break
-                    time.sleep(1.0)
-            watchdog_thread = threading.Thread(target=check_stuck, daemon=True)
-            watchdog_thread.start()
+            if not image_files:
+                self.log("Error: No valid image files found at target source path.")
+                return
 
-            self.update_progress_display(idx, total_files)
-            
-            filename = os.path.basename(file_path)
-            self.log(f"Scanning file: {filename}")
-            
-            with open(file_path, 'rb') as f:
-                file_hash = hashlib.md5(f.read()).hexdigest()
-            
-            if file_hash in tracker.hash_cache:
-                self.log("  [MD5 Cache Hit] Bypassing APIs, using cached resolution.")
-                cached_data = tracker.hash_cache[file_hash]
-                target_folder = cached_data['folder']
-                tag_dict = cached_data.get('tag_dict', {'combined': cached_data.get('tags', '')})
-                cached_thumb = cached_data.get('thumb', '')
+            self.log(f"\n--- Connecting to Local LLM Base URL at {lm_url} ---")
+            client = OpenAI(base_url=lm_url, api_key="lm-studio")
+            try:
+                models = client.models.list()
+                model_id = models.data[0].id
+                self.log(f"Connected! Active model loaded: {model_id}")
+            except Exception as e:
+                self.log(f"Warning: Could not fetch models list. Using fallback ID. ({e})", full_only=False)
+                model_id = "local-model"
+
+            total_files = len(image_files)
+            self.log(f"Starting sequential execution of {total_files} item(s) in [{exec_mode}]...")
+
+            for idx, file_path in enumerate(image_files, 1):
+                if self.stop_requested: break
+                self.skip_requested = False
+                self.file_in_progress = True
+
+                self.update_progress_display(idx, total_files)
                 
+                filename = os.path.basename(file_path)
+                self.log(f"Scanning file: {filename}")
+                
+                with open(file_path, 'rb') as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+                
+                if file_hash in tracker.hash_cache:
+                    self.log("  [MD5 Cache Hit] Bypassing APIs, using cached resolution.")
+                    cached_data = tracker.hash_cache[file_hash]
+                    target_folder = cached_data['folder']
+                    tag_dict = cached_data.get('tag_dict', {'combined': cached_data.get('tags', '')})
+                    cached_thumb = cached_data.get('thumb', '')
+                    cached_match_url = cached_data.get('matched_url', '')
+                    
+                    final_dest_path = os.path.join(self.dest_path, target_folder)
+                    os.makedirs(final_dest_path, exist_ok=True)
+                    target_file_path = os.path.join(final_dest_path, filename)
+                    shutil.move(file_path, target_file_path)
+                    
+                    self.embed_metadata(target_file_path, tag_dict)
+                    self.log(f"  -> Moved into: /{target_folder}/{filename} (Cached)\n")
+                    
+                    tracker.files_moved += 1
+                    tracker.matched_files_moved += 1
+                    self.update_metrics_display()
+                    self.add_history_item(file_path, target_file_path, filename, is_unmatched=False, match_thumb_url=cached_thumb, match_url=cached_match_url)
+                    
+                    self.file_in_progress = False
+                    if "Single" in exec_mode: break
+                    else: 
+                        time.sleep(0.1)
+                        continue
+                
+                def _reset_match_thumb():
+                    self.lbl_match_thumb.configure(text="[Searching...]", image="")
+                    self.lbl_match_thumb.image = None
+                self.after(0, _reset_match_thumb)
+                self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Searching..."))
+                self.load_local_thumbnail(file_path)
+
+                chosen_match = None
+                tag_dict = {}
+                formatted_tags = ""
+                match_thumb = ""
+                matched_url = ""
+
+                if use_embedded:
+                    embedded_str = extract_embedded_tags(file_path)
+                    if embedded_str:
+                        formatted_tags = normalize_tag(embedded_str)
+                        tag_dict = {
+                            'artist': '', 'copyright': '', 'character': '',
+                            'general': formatted_tags, 'meta': '', 'combined': formatted_tags, 'matched_url': ''
+                        }
+                        chosen_match = {'engine': 'Embedded Metadata', 'title': 'Embedded Metadata Match', 'similarity': 100.0, 'booru_ids': {}, 'thumb': ''}
+                    elif skip_no_embedded:
+                        self.log(f"  [Embedded Metadata] No embedded tags found in {filename}. Skipping file entirely.\n")
+                        self.file_in_progress = False
+                        if "Single" in exec_mode: break
+                        else: continue
+
+                if not chosen_match and not self.stop_requested:
+                    primary_engine = engine_choice
+                    fallback_sequence = []
+                    
+                    if "IQDB" in primary_engine:
+                        fallback_sequence = [
+                            ('IQDB', lambda fp: self.search_iqdb_engine(fp, is_fallback=False)),
+                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_key, is_fallback=True)) if allow_engine_fallback else None,
+                            ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id)) if allow_vision_fallback else None
+                        ]
+                    elif "SauceNAO" in primary_engine:
+                        fallback_sequence = [
+                            ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_key, is_fallback=False)),
+                            ('IQDB', lambda fp: self.search_iqdb_engine(fp, is_fallback=True)) if allow_engine_fallback else None,
+                            ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id)) if allow_vision_fallback else None
+                        ]
+                    else:
+                        fallback_sequence = [
+                            ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id))
+                        ]
+
+                    for step_info in fallback_sequence:
+                        if not step_info or self.stop_requested or self.skip_requested: continue
+                        eng_label, search_func = step_info
+                        
+                        matches = search_func(file_path)
+                        if not matches: continue
+                        
+                        candidate_match = matches[0]
+                        cand_thumb = candidate_match.get('thumb', '')
+                        cand_url = candidate_match.get('fallback_url', '') or candidate_match.get('title', '')
+                        
+                        if eng_label == 'Local Vision LLM':
+                            chosen_match = candidate_match
+                            tag_dict = candidate_match.get('tag_dict_override', {})
+                            formatted_tags = tag_dict.get('combined', '')
+                            matched_url = ''
+                            match_thumb = ''
+                            break
+                        
+                        test_tag_dict = self.fetch_tags(file_path, candidate_match, tag_choice, db_user, db_key, gb_user, gb_key)
+                        test_combined = test_tag_dict.get('combined', '')
+                        
+                        if test_combined:
+                            chosen_match = candidate_match
+                            tag_dict = test_tag_dict
+                            formatted_tags = test_combined
+                            matched_url = test_tag_dict.get('matched_url', '') or cand_url
+                            match_thumb = cand_thumb
+                            break
+                        else:
+                            if not match_thumb and cand_thumb: match_thumb = cand_thumb
+                            if not matched_url and cand_url: matched_url = cand_url
+                            self.log(f"  [{eng_label}] Match found on unsupported source (e.g. Twitter), continuing search chain for extractable tags...")
+
+                if self.stop_requested:
+                    self.file_in_progress = False
+                    break
+
+                if self.skip_requested:
+                    self.log(f"  [Skipped] User requested skip for {filename}.\n")
+                    self.file_in_progress = False
+                    self.btn_skip.configure(state="normal", fg_color="#e67700")
+                    continue
+
+                if chosen_match and chosen_match.get('engine') != 'Embedded Metadata':
+                    eng_name = chosen_match.get('engine', engine_choice)
+                    sim_score = chosen_match.get('similarity', 0.0)
+                    sim_str = f" ({eng_name} {sim_score:.1f}% Similarity)" if sim_score > 0 else f" ({eng_name} Match)"
+                    self.log(f"  Match Confirmed{sim_str}: {chosen_match['title']}")
+                    if match_thumb: self.update_match_thumbnail(match_thumb)
+                    self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Search Match Confirmed"))
+                elif not chosen_match:
+                    self.log("  Search engine returned no matches.")
+                    def _clear_match_thumb():
+                        self.lbl_match_thumb.configure(text="[No Match]", image="")
+                        self.lbl_match_thumb.image = None
+                    self.after(0, _clear_match_thumb)
+                    self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Unmatched"))
+
+                if self.stop_requested:
+                    self.file_in_progress = False
+                    break
+
+                if self.skip_requested:
+                    self.log(f"  [Skipped] User requested skip for {filename}.\n")
+                    self.file_in_progress = False
+                    self.btn_skip.configure(state="normal", fg_color="#e67700")
+                    continue
+
+                is_unmatched = False
+                if not chosen_match:
+                    is_unmatched = True
+                elif not formatted_tags and not chosen_match.get('title'):
+                    is_unmatched = True
+                elif chosen_match and not any(chosen_match.get('booru_ids', {}).values()) and not formatted_tags and chosen_match.get('engine') != 'Local Vision LLM':
+                    is_unmatched = True
+                    self.log("  [Unsupported Source] All engines exhausted without booru tag support. Treating as unmatched/skipped for tagging, but recording match history.")
+
+                if is_unmatched:
+                    action = self.opt_unmatched.get()
+                    if "Leave" in action:
+                        self.log(f"  [Unmatched] Leaving {filename} in source directory.\n")
+                    else:
+                        dest_unmatched = self.unmatched_path
+                        if not dest_unmatched or not os.path.exists(dest_unmatched):
+                            dest_unmatched = os.path.join(self.dest_path, "Unmatched") if self.dest_path else os.path.abspath("./Unmatched")
+                        
+                        os.makedirs(dest_unmatched, exist_ok=True)
+                        target_file_path = os.path.join(dest_unmatched, filename)
+                        shutil.move(file_path, target_file_path)
+                        self.log(f"  -> Moved into Unmatched Folder: {target_file_path}\n")
+                        
+                        tracker.files_moved += 1
+                        tracker.unmatched_files_moved += 1
+                        self.update_metrics_display()
+                        self.add_history_item(file_path, target_file_path, filename, is_unmatched=True, match_thumb_url=match_thumb, match_url=matched_url)
+
+                    self.file_in_progress = False
+                    self.btn_skip.configure(state="normal", fg_color="#e67700")
+                    if "Single" in exec_mode: break
+                    else: continue
+
+                if not formatted_tags and chosen_match:
+                    formatted_tags = normalize_tag(chosen_match.get('title', ''))
+                    tag_dict['combined'] = formatted_tags
+                    tag_dict['general'] = formatted_tags
+
+                if formatted_tags:
+                    tag_list = formatted_tags.split()
+                    if len(tag_list) > 50:
+                        formatted_tags = " ".join(tag_list[:50])
+
+                available_folders = []
+                if not os.path.exists(self.dest_path): os.makedirs(self.dest_path)
+                
+                scan_subfolders = bool(self.switch_scan_subfolders.get() == 1)
+
+                for item in os.listdir(self.dest_path):
+                    full_item_path = os.path.join(self.dest_path, item)
+                    if os.path.isdir(full_item_path) and item not in ["Unmatched", "Unsorted"] and not item.startswith("."):
+                        available_folders.append(item)
+                        if scan_subfolders:
+                            try:
+                                for subitem in os.listdir(full_item_path):
+                                    full_subitem_path = os.path.join(full_item_path, subitem)
+                                    if os.path.isdir(full_subitem_path) and not subitem.startswith("."):
+                                        available_folders.append(f"{item}/{subitem}")
+                            except Exception:
+                                pass
+
+                target_folder = "Unsorted"
+                if available_folders and formatted_tags and not self.stop_requested:
+                    try:
+                        system_p = (
+                            "You are a strict file router. Analyze the tags and select the single best matching "
+                            "folder path strictly from the provided available folders list. "
+                            "If no folder matches well, you MUST output 'Unsorted'. Do not invent or create new folder names. "
+                            "Output ONLY valid JSON in this exact format: {\"destination\": \"FolderPath\"}"
+                        )
+                        user_p = f"Tags: {formatted_tags}\nFolders:\n{json.dumps(available_folders)}"
+                        
+                        response = client.chat.completions.create(
+                            model=model_id,
+                            messages=[{"role": "system", "content": system_p}, {"role": "user", "content": user_p}],
+                            temperature=0.0,
+                            max_tokens=100
+                        )
+                        content = response.choices[0].message.content.strip()
+
+                        if content.startswith("```"):
+                            content = content.split("```")[1]
+                            if content.startswith("json"): content = content[4:]
+                        res_json = json.loads(content.strip())
+                        raw_dest = res_json.get("destination", "Unsorted")
+                        target_folder = sanitize_foldername(raw_dest)
+                        
+                        if target_folder not in available_folders and target_folder != "Unsorted":
+                            target_folder = "Unsorted"
+                            
+                    except Exception as llm_err:
+                        if not self.stop_requested:
+                            self.log(f"  [LLM Error]: {llm_err}", full_only=False)
+                        target_folder = "Unsorted"
+
+                if self.stop_requested:
+                    self.file_in_progress = False
+                    break
+
                 final_dest_path = os.path.join(self.dest_path, target_folder)
                 os.makedirs(final_dest_path, exist_ok=True)
                 target_file_path = os.path.join(final_dest_path, filename)
                 shutil.move(file_path, target_file_path)
                 
                 self.embed_metadata(target_file_path, tag_dict)
-                self.log(f"  -> Moved into: /{target_folder}/{filename} (Cached)\n")
+
+                if formatted_tags and target_folder != "Unsorted":
+                    tracker.hash_cache[file_hash] = {'tags': formatted_tags, 'folder': target_folder, 'tag_dict': tag_dict, 'thumb': match_thumb, 'matched_url': matched_url}
                 
                 tracker.files_moved += 1
                 tracker.matched_files_moved += 1
                 self.update_metrics_display()
-                self.after(0, lambda p=file_path, tp=target_file_path, f=filename, th=cached_thumb: self.add_history_item(p, tp, f, is_unmatched=False, match_thumb_url=th))
                 
-                self.file_in_progress = False
-                if "Single" in exec_mode: break
-                else: 
-                    time.sleep(0.1)
-                    continue
-            
-            def _reset_match_thumb():
-                self.lbl_match_thumb.configure(text="[Searching...]", image="")
-                self.lbl_match_thumb.image = None
-            self.after(0, _reset_match_thumb)
-            self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Searching..."))
-            self.load_local_thumbnail(file_path)
-
-            matches = []
-            if not self.skip_requested and not self.stop_requested:
-                if "IQDB" in engine_choice:
-                    matches = self.search_iqdb_engine(file_path, is_fallback=False)
-                    if not matches and allow_engine_fallback and not self.stop_requested and not self.skip_requested:
-                        self.log("  IQDB returned no match. [Engine Fallback -> SauceNAO]...")
-                        matches = self.search_saucenao_engine(file_path, saucenao_key, is_fallback=True)
-                    if not matches and allow_vision_fallback and not self.stop_requested and not self.skip_requested:
-                        self.log("  Traditional search failed. [Engine Fallback -> Local Vision LLM]...")
-                        matches = self.search_local_vision_engine(file_path, client, model_id)
-                elif "SauceNAO" in engine_choice:
-                    matches = self.search_saucenao_engine(file_path, saucenao_key, is_fallback=False)
-                    if not matches and allow_engine_fallback and not self.stop_requested and not self.skip_requested:
-                        self.log("  SauceNAO returned no match. [Engine Fallback -> IQDB]...")
-                        matches = self.search_iqdb_engine(file_path, is_fallback=True)
-                    if not matches and allow_vision_fallback and not self.stop_requested and not self.skip_requested:
-                        self.log("  Traditional search failed. [Engine Fallback -> Local Vision LLM]...")
-                        matches = self.search_local_vision_engine(file_path, client, model_id)
-                else: # Local Vision LLM selected as primary engine
-                    matches = self.search_local_vision_engine(file_path, client, model_id)
-
-            if self.skip_requested:
-                self.log(f"  [Skipped] User requested skip for {filename}.\n")
-                self.file_in_progress = False
-                self.btn_skip.configure(state="normal", fg_color="#e67700")
-                continue
-
-            if self.stop_requested:
-                self.file_in_progress = False
-                break
-
-            chosen_match = matches[0] if matches else None
-            tag_dict = {}
-            formatted_tags = ""
-            match_thumb = ""
-
-            if chosen_match:
-                eng_name = chosen_match.get('engine', engine_choice)
-                sim_score = chosen_match.get('similarity', 0.0)
-                sim_str = f" ({eng_name} {sim_score:.1f}% Similarity)" if sim_score > 0 else f" ({eng_name} Match)"
-                self.log(f"  Match Confirmed{sim_str}: {chosen_match['title']}")
-                match_thumb = chosen_match.get('thumb', '')
-                if match_thumb: self.update_match_thumbnail(match_thumb)
-                self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Search Match Confirmed"))
-                
-                if 'tag_dict_override' in chosen_match:
-                    tag_dict = chosen_match['tag_dict_override']
-                    formatted_tags = tag_dict.get('combined', '')
-                else:
-                    tag_dict = self.fetch_tags(file_path, chosen_match, tag_choice, db_user, db_key, gb_user, gb_key)
-                    formatted_tags = tag_dict.get('combined', '')
-            else:
-                self.log("  Search engine returned no matches.")
-                def _clear_match_thumb():
-                    self.lbl_match_thumb.configure(text="[No Match]", image="")
-                    self.lbl_match_thumb.image = None
-                self.after(0, _clear_match_thumb)
-                self.after(0, lambda: self.lbl_details.configure(text=f"File: {filename}\nStatus: Unmatched"))
-
-            if self.skip_requested:
-                self.log(f"  [Skipped] User requested skip for {filename}.\n")
-                self.file_in_progress = False
-                self.btn_skip.configure(state="normal", fg_color="#e67700")
-                continue
-
-            if self.stop_requested:
-                self.file_in_progress = False
-                break
-
-            is_unmatched = False
-            if not chosen_match:
-                is_unmatched = True
-            elif not formatted_tags and not chosen_match.get('title'):
-                is_unmatched = True
-
-            if is_unmatched:
-                action = self.opt_unmatched.get()
-                if "Leave" in action:
-                    self.log(f"  [Unmatched] Leaving {filename} in source directory.\n")
-                else:
-                    dest_unmatched = self.unmatched_path
-                    if not dest_unmatched or not os.path.exists(dest_unmatched):
-                        dest_unmatched = os.path.join(self.dest_path, "Unmatched") if self.dest_path else os.path.abspath("./Unmatched")
-                    
-                    os.makedirs(dest_unmatched, exist_ok=True)
-                    target_file_path = os.path.join(dest_unmatched, filename)
-                    shutil.move(file_path, target_file_path)
-                    self.log(f"  -> Moved into Unmatched Folder: {target_file_path}\n")
-                    
-                    tracker.files_moved += 1
-                    tracker.unmatched_files_moved += 1
-                    self.update_metrics_display()
-                    self.after(0, lambda p=file_path, tp=target_file_path, f=filename, th=match_thumb: self.add_history_item(p, tp, f, is_unmatched=True, match_thumb_url=th))
+                self.log(f"  -> Moved into: /{target_folder}/{filename}\n")
+                self.add_history_item(file_path, target_file_path, filename, is_unmatched=False, match_thumb_url=match_thumb, match_url=matched_url)
 
                 self.file_in_progress = False
                 self.btn_skip.configure(state="normal", fg_color="#e67700")
-                if "Single" in exec_mode: break
-                else: 
-                    time.sleep(1.0)
-                    continue
 
-            if not formatted_tags and chosen_match:
-                self.log("  [Warning] No tags extracted from any booru. Defaulting to HTML Title for routing.")
-                formatted_tags = normalize_tag(chosen_match.get('title', ''))
-                tag_dict['combined'] = formatted_tags
-                tag_dict['general'] = formatted_tags
+                if "Single" in exec_mode:
+                    break
 
-            if formatted_tags:
-                tag_list = formatted_tags.split()
-                if len(tag_list) > 400:
-                    formatted_tags = " ".join(tag_list[:400])
-
-            available_folders = []
-            if not os.path.exists(self.dest_path): os.makedirs(self.dest_path)
-            
-            scan_subfolders = bool(self.switch_scan_subfolders.get() == 1)
-
-            for item in os.listdir(self.dest_path):
-                full_item_path = os.path.join(self.dest_path, item)
-                if os.path.isdir(full_item_path) and item not in ["Unmatched", "Unsorted"]:
-                    available_folders.append(item)
-                    if scan_subfolders:
-                        try:
-                            for subitem in os.listdir(full_item_path):
-                                full_subitem_path = os.path.join(full_item_path, subitem)
-                                if os.path.isdir(full_subitem_path):
-                                    available_folders.append(f"{item}/{subitem}")
-                        except Exception:
-                            pass
-
-            target_folder = "Unsorted"
-            if available_folders and formatted_tags:
-                try:
-                    system_p = (
-                        "You are a strict file router. Analyze the tags and select the single best matching "
-                        "folder path strictly from the provided available folders list. "
-                        "If no folder matches well, you MUST output 'Unsorted'. Do not invent or create new folder names. "
-                        "Output ONLY valid JSON in this exact format: {\"destination\": \"FolderPath\"}"
-                    )
-                    user_p = f"Tags: {formatted_tags}\nFolders:\n{json.dumps(available_folders, indent=2)}"
-                    
-                    response = client.chat.completions.create(
-                        model=model_id,
-                        messages=[{"role": "system", "content": system_p}, {"role": "user", "content": user_p}],
-                        temperature=0.0
-                    )
-                    content = response.choices[0].message.content.strip()
-                    if content.startswith("```"):
-                        content = content.split("```")[1]
-                        if content.startswith("json"): content = content[4:]
-                    res_json = json.loads(content.strip())
-                    raw_dest = res_json.get("destination", "Unsorted")
-                    target_folder = sanitize_foldername(raw_dest)
-                    
-                    # PROGRAMMATIC SAFEGUARD: Enforce that folder exists in library
-                    if target_folder not in available_folders and target_folder != "Unsorted":
-                        self.log(f"  [Router Safeguard] LLM suggested unlisted folder '{target_folder}'. Forcing to 'Unsorted'.")
-                        target_folder = "Unsorted"
-                        
-                except Exception as llm_err:
-                    self.log(f"  [LLM Error]: {llm_err}")
-                    target_folder = "Unsorted"
-
-            final_dest_path = os.path.join(self.dest_path, target_folder)
-            os.makedirs(final_dest_path, exist_ok=True)
-            target_file_path = os.path.join(final_dest_path, filename)
-            shutil.move(file_path, target_file_path)
-            
-            self.embed_metadata(target_file_path, tag_dict)
-
-            if formatted_tags and target_folder != "Unsorted":
-                tracker.hash_cache[file_hash] = {'tags': formatted_tags, 'folder': target_folder, 'tag_dict': tag_dict, 'thumb': match_thumb}
-            
-            tracker.files_moved += 1
-            tracker.matched_files_moved += 1
-            self.update_metrics_display()
-            
-            self.log(f"  -> Moved into: /{target_folder}/{filename}\n")
-            self.after(0, lambda p=file_path, tp=target_file_path, f=filename, th=match_thumb: self.add_history_item(p, tp, f, is_unmatched=False, match_thumb_url=th))
-
+            self.log("=== Execution Queue Stopped/Complete ==.")
+        except Exception as e:
+            self.log(f"Critical Workflow Error: {e}")
+        finally:
+            self.save_settings()
+            self.is_processing = False
+            self.stop_requested = False
+            self.skip_requested = False
             self.file_in_progress = False
-            self.btn_skip.configure(state="normal", fg_color="#e67700")
-
-            if "Single" in exec_mode:
-                self.log("Paused after single file (Single File Review Mode active).")
-                break
-            else:
-                time.sleep(1.0)
-
-        self.log("=== Execution Queue Stopped/Complete ==.")
-        self.save_settings()
-        self.is_processing = False
-        self.stop_requested = False
-        self.skip_requested = False
-        self.file_in_progress = False
-        def _reset_final():
-            self.btn_start.configure(state="normal", fg_color="#2b8a3e")
-            self.btn_skip.configure(state="disabled", fg_color="gray")
-            self.btn_cancel.configure(state="disabled", fg_color="gray")
-            self.title("Tag-AI Booru Image Sorter")
-        self.after(0, _reset_final)
+            def _reset_final():
+                self.btn_start.configure(state="normal", fg_color="#2b8a3e")
+                self.btn_skip.configure(state="disabled", fg_color="gray")
+                self.btn_cancel.configure(state="disabled", text="Cancel Execution", fg_color="#c92a2a")
+                self.title("Tag-AI Booru Image Sorter")
+            self.after(0, _reset_final)
 
 if __name__ == "__main__":
     app = BooruManagerApp()
