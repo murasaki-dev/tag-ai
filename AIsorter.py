@@ -438,7 +438,12 @@ class BooruManagerApp(ctk.CTk):
         self.history_page = 0
         self.history_per_page = 50
         
-        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        # Robust config path supporting both compiled .exe and python script execution
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config_file = os.path.join(base_dir, "config.json")
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -1247,21 +1252,21 @@ class BooruManagerApp(ctk.CTk):
             "unmatched_folder": self.unmatched_path,
             "engine": self.opt_engine.get(),
             "tags": self.opt_tags.get(),
-            "fallback": self.switch_engine_fallback.get(),
-            "vision_fallback": self.switch_vision_fallback.get(),
-            "serpapi_enabled": self.switch_serpapi.get(),
-            "gvision_enabled": self.switch_gvision.get(),
-            "skip_on_web_fail": self.switch_skip_on_web_fail.get(),
+            "fallback": int(self.switch_engine_fallback.get()),
+            "vision_fallback": int(self.switch_vision_fallback.get()),
+            "serpapi_enabled": int(self.switch_serpapi.get()),
+            "gvision_enabled": int(self.switch_gvision.get()),
+            "skip_on_web_fail": int(self.switch_skip_on_web_fail.get()),
             "vision_warning_shown": self.vision_warning_shown,
-            "scan_subfolders": self.switch_scan_subfolders.get(),
-            "use_embedded_tags": self.switch_use_embedded_tags.get(),
-            "skip_no_embedded": self.switch_skip_no_embedded.get(),
-            "embed_metadata": self.switch_embed_metadata.get(),
-            "meta_artist": self.switch_meta_artist.get(),
-            "meta_series": self.switch_meta_series.get(),
-            "meta_character": self.switch_meta_character.get(),
-            "meta_general": self.switch_meta_general.get(),
-            "meta_meta": self.switch_meta_meta.get(),
+            "scan_subfolders": int(self.switch_scan_subfolders.get()),
+            "use_embedded_tags": int(self.switch_use_embedded_tags.get()),
+            "skip_no_embedded": int(self.switch_skip_no_embedded.get()),
+            "embed_metadata": int(self.switch_embed_metadata.get()),
+            "meta_artist": int(self.switch_meta_artist.get()),
+            "meta_series": int(self.switch_meta_series.get()),
+            "meta_character": int(self.switch_meta_character.get()),
+            "meta_general": int(self.switch_meta_general.get()),
+            "meta_meta": int(self.switch_meta_meta.get()),
             "serpapi_keys": [ent.get().strip() for _, ent in self.serpapi_entries if ent.get().strip()],
             "gvision_keys": [ent.get().strip() for _, ent in self.gvision_entries if ent.get().strip()],
             "db_users": [ent.get().strip() for _, ent in self.db_user_entries if ent.get().strip()],
@@ -1300,6 +1305,7 @@ class BooruManagerApp(ctk.CTk):
             
             if "engine" in config: self.opt_engine.set(config["engine"])
             if "tags" in config: self.opt_tags.set(config["tags"])
+            
             if config.get("fallback", 1): self.switch_engine_fallback.select() 
             else: self.switch_engine_fallback.deselect()
             
@@ -1308,26 +1314,6 @@ class BooruManagerApp(ctk.CTk):
 
             if config.get("serpapi_enabled", 0): self.switch_serpapi.select()
             else: self.switch_serpapi.deselect()
-
-            # Load multi keys
-            for list_frame, entries, vals, add_func in [
-                (self.serpapi_list_frame, self.serpapi_entries, config.get("serpapi_keys", [config.get("serpapi_key", "")]), self.add_serpapi_field),
-                (self.gvision_list_frame, self.gvision_entries, config.get("gvision_keys", [config.get("gvision_key", "")]), self.add_gvision_field),
-                (self.db_user_list_frame, self.db_user_entries, config.get("db_users", [config.get("db_user", "")]), self.add_db_user_field),
-                (self.db_key_list_frame, self.db_key_entries, config.get("db_keys", [config.get("db_key", "")]), self.add_db_key_field),
-                (self.gb_user_list_frame, self.gb_user_entries, config.get("gb_users", [config.get("gb_user", "")]), self.add_gb_user_field),
-                (self.gb_key_list_frame, self.gb_key_entries, config.get("gb_keys", [config.get("gb_key", "")]), self.add_gb_key_field),
-                (self.skey_list_frame, self.skey_entries, config.get("skeys", [config.get("skey", "")]), self.add_skey_field),
-            ]:
-                if vals:
-                    for row, ent in list(entries):
-                        row.destroy()
-                    entries.clear()
-                    for v in vals:
-                        if v.strip():
-                            add_func(v.strip())
-                    if not entries:
-                        add_func()
 
             if config.get("gvision_enabled", 0): self.switch_gvision.select()
             else: self.switch_gvision.deselect()
@@ -1365,6 +1351,47 @@ class BooruManagerApp(ctk.CTk):
 
             if config.get("meta_meta", 0): self.switch_meta_meta.select()
             else: self.switch_meta_meta.deselect()
+
+            # Load multi-key fields safely supporting legacy config keys as fallback
+            serp_vals = config.get("serpapi_keys", [])
+            if not serp_vals and config.get("serpapi_key"): serp_vals = [config.get("serpapi_key")]
+            
+            gvis_vals = config.get("gvision_keys", [])
+            if not gvis_vals and config.get("gvision_key"): gvis_vals = [config.get("gvision_key")]
+
+            db_u_vals = config.get("db_users", [])
+            if not db_u_vals and config.get("db_user"): db_u_vals = [config.get("db_user")]
+
+            db_k_vals = config.get("db_keys", [])
+            if not db_k_vals and config.get("db_key"): db_k_vals = [config.get("db_key")]
+
+            gb_u_vals = config.get("gb_users", [])
+            if not gb_u_vals and config.get("gb_user"): gb_u_vals = [config.get("gb_user")]
+
+            gb_k_vals = config.get("gb_keys", [])
+            if not gb_k_vals and config.get("gb_key"): gb_k_vals = [config.get("gb_key")]
+
+            s_vals = config.get("skeys", [])
+            if not s_vals and config.get("skey"): s_vals = [config.get("skey")]
+
+            for list_frame, entries, vals, add_func in [
+                (self.serpapi_list_frame, self.serpapi_entries, serp_vals, self.add_serpapi_field),
+                (self.gvision_list_frame, self.gvision_entries, gvis_vals, self.add_gvision_field),
+                (self.db_user_list_frame, self.db_user_entries, db_u_vals, self.add_db_user_field),
+                (self.db_key_list_frame, self.db_key_entries, db_k_vals, self.add_db_key_field),
+                (self.gb_user_list_frame, self.gb_user_entries, gb_u_vals, self.add_gb_user_field),
+                (self.gb_key_list_frame, self.gb_key_entries, gb_k_vals, self.add_gb_key_field),
+                (self.skey_list_frame, self.skey_entries, s_vals, self.add_skey_field),
+            ]:
+                if vals:
+                    for row, ent in list(entries):
+                        row.destroy()
+                    entries.clear()
+                    for v in vals:
+                        if v.strip():
+                            add_func(v.strip())
+                    if not entries:
+                        add_func()
 
             self.ent_lm.delete(0, 'end')
             self.ent_lm.insert(0, config.get("lm_url", "http://localhost:1234/v1"))
