@@ -3,16 +3,20 @@ import time
 import json
 import re
 import threading
+import queue
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import requests
 import hashlib
 import platform
 import subprocess
 import base64
+import sqlite3
 import sys
 import webbrowser
 from io import BytesIO
-from PIL import Image, PngImagePlugin
+from PIL import Image, ImageOps, PngImagePlugin
 from openai import OpenAI
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -31,6 +35,153 @@ if platform.system() == "Windows":
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+
+_http_session_state = threading.local()
+
+def get_http_session():
+    """Reuse keep-alive connections per thread without sharing Sessions across threads."""
+    session = getattr(_http_session_state, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _http_session_state.session = session
+    return session
+
+def stream_file_md5(file_path, chunk_size=1024 * 1024):
+    """Hash a file without loading its entire contents into memory."""
+    digest = hashlib.md5()
+    with open(file_path, "rb") as image_file:
+        for chunk in iter(lambda: image_file.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def encode_vision_image(file_path, max_side=1280, quality=86):
+    """Create a correctly oriented, bounded-size JPEG payload for vision requests."""
+    with Image.open(file_path) as source:
+        image = ImageOps.exif_transpose(source)
+        if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        image.thumbnail((max_side, max_side), resampling)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+def canonical_name(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+def exact_identity_folder(tag_dict, available_folders):
+    """Fast route only when one folder exactly matches a copyright/character tag."""
+    identity_tags = []
+    for category in ("copyright", "character"):
+        identity_tags.extend((tag_dict.get(category) or "").split())
+    normalized_tags = {canonical_name(tag) for tag in identity_tags if canonical_name(tag)}
+    if not normalized_tags:
+        return None
+    matches = []
+    for folder in available_folders:
+        leaf = folder.replace(chr(92), "/").rstrip("/").split("/")[-1]
+        if canonical_name(leaf) in normalized_tags:
+            matches.append(folder)
+    return matches[0] if len(matches) == 1 else None
+
+class PersistentResultCache:
+    """SQLite cache for completed image results and short-lived negative results."""
+    NEGATIVE_TTL_SECONDS = 6 * 60 * 60
+
+    def __init__(self, path):
+        from contextlib import closing
+        self.path = path
+        self.lock = threading.Lock()
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""CREATE TABLE IF NOT EXISTS image_results (
+                    image_hash TEXT PRIMARY KEY,
+                    settings_signature TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    saved_at REAL NOT NULL
+                )""")
+
+    def _connect(self):
+        return sqlite3.connect(self.path, timeout=10)
+
+    def get(self, image_hash, settings_signature):
+        try:
+            return self._get_unchecked(image_hash, settings_signature)
+        except (sqlite3.Error, OSError):
+            return None
+
+    def _get_unchecked(self, image_hash, settings_signature):
+        from contextlib import closing
+        with self.lock, closing(self._connect()) as conn:
+            with conn:
+                row = conn.execute(
+                    "SELECT settings_signature, status, payload, saved_at FROM image_results WHERE image_hash = ?",
+                    (image_hash,),
+                ).fetchone()
+                if row is None:
+                    return None
+                signature, status, payload, saved_at = row
+                expired_negative = status == "miss" and time.time() - saved_at > self.NEGATIVE_TTL_SECONDS
+                if signature != settings_signature or expired_negative:
+                    conn.execute("DELETE FROM image_results WHERE image_hash = ?", (image_hash,))
+                    return None
+                try:
+                    return {"status": status, **json.loads(payload)}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    conn.execute("DELETE FROM image_results WHERE image_hash = ?", (image_hash,))
+                    return None
+
+    def put(self, image_hash, settings_signature, status, payload=None):
+        try:
+            self._put_unchecked(image_hash, settings_signature, status, payload)
+        except (sqlite3.Error, OSError):
+            return None
+
+    def _put_unchecked(self, image_hash, settings_signature, status, payload=None):
+        from contextlib import closing
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        with self.lock, closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO image_results (image_hash, settings_signature, status, payload, saved_at) VALUES (?, ?, ?, ?, ?)",
+                    (image_hash, settings_signature, status, payload_json, time.time()),
+                )
+
+    def clear(self):
+        try:
+            self._clear_unchecked()
+        except (sqlite3.Error, OSError):
+            return None
+
+    def _clear_unchecked(self):
+        from contextlib import closing
+        with self.lock, closing(self._connect()) as conn:
+            with conn:
+                conn.execute("DELETE FROM image_results")
+
+    def close(self):
+        return None
+
+class DisabledResultCache:
+    """Fallback that preserves application operation if the cache file is unavailable."""
+    def get(self, image_hash, settings_signature):
+        return None
+    def put(self, image_hash, settings_signature, status, payload=None):
+        return None
+    def clear(self):
+        return None
+    def close(self):
+        return None
 
 class StdoutRedirector:
     """Redirects stdout and stderr to the GUI application log window."""
@@ -292,7 +443,7 @@ def fetch_google_lens_context(file_path, api_keys, log_callback=None):
             
             upload_url = "https://serpapi.com/image"
             with open(upload_path, "rb") as img_file:
-                upload_response = requests.post(
+                upload_response = get_http_session().post(
                     upload_url,
                     data={"api_key": api_key.strip()},
                     files={"image": img_file},
@@ -319,7 +470,7 @@ def fetch_google_lens_context(file_path, api_keys, log_callback=None):
                 "hl": "en"
             }
             
-            response = requests.get(search_url, params=params, timeout=15)
+            response = get_http_session().get(search_url, params=params, timeout=15)
             
             if response.status_code == 200:
                 data = response.json()
@@ -380,7 +531,7 @@ def fetch_google_vision_web_detection(file_path, api_keys, log_callback=None):
                 ]
             }
             
-            response = requests.post(url, json=payload, timeout=15)
+            response = get_http_session().post(url, json=payload, timeout=15)
             if response.status_code == 200:
                 data = response.json()
                 responses = data.get("responses", [])
@@ -415,12 +566,17 @@ class BooruManagerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        # Avoid exposing the native window while the large CustomTkinter
+        # widget tree is still being constructed. Showing it after idle lets
+        # Tk calculate the complete layout before the first visible paint.
+        self.withdraw()
         self.title("Tag-AI Booru Image Sorter")
         self.geometry("1150x960")
         self.minsize(980, 760)
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        self._log_queue = queue.SimpleQueue()
         sys.stdout = StdoutRedirector(self.log)
         sys.stderr = StdoutRedirector(self.log)
 
@@ -432,11 +588,17 @@ class BooruManagerApp(ctk.CTk):
         self.dest_path = os.path.abspath("./organized_library")
         self.unmatched_path = ""
         self.vision_warning_shown = False
-        self.api_panel_visible = True
+        self.api_panel_visible = False
         
         self.history_items = []
         self.history_page = 0
-        self.history_per_page = 50
+        self.history_per_page = 12
+        self.history_thumb_cache = OrderedDict()
+        self.history_thumb_cache_limit = 128
+        self.history_thumb_inflight = set()
+        self.history_thumb_waiters = {}
+        self.history_thumb_lock = threading.Lock()
+        self.history_thumb_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="history-thumb")
         
         # Robust config path supporting both compiled .exe and python script execution
         if getattr(sys, 'frozen', False):
@@ -444,6 +606,10 @@ class BooruManagerApp(ctk.CTk):
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
         self.config_file = os.path.join(base_dir, "config.json")
+        try:
+            self.result_cache = PersistentResultCache(os.path.join(base_dir, "image_result_cache.sqlite3"))
+        except Exception:
+            self.result_cache = DisabledResultCache()
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -455,8 +621,20 @@ class BooruManagerApp(ctk.CTk):
         self.logo_label = ctk.CTkLabel(self.sidebar_container, text="🏷️ Tag-AI Image Sorter", font=ctk.CTkFont(size=18, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        self.scroll_frame = ctk.CTkScrollableFrame(self.sidebar_container, width=290, fg_color="transparent")
-        self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=5)
+        # Keep the sidebar compact by grouping controls by task. Each tab can
+        # scroll independently while the processing controls stay pinned below.
+        self.sidebar_tabs = ctk.CTkTabview(self.sidebar_container, width=300)
+        self.sidebar_tabs.grid(row=1, column=0, sticky="nsew", padx=5)
+        self.tab_run_settings = self.sidebar_tabs.add("Run")
+        self.tab_search_settings = self.sidebar_tabs.add("Search")
+        self.tab_output_settings = self.sidebar_tabs.add("Output")
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self.tab_run_settings, fg_color="transparent")
+        self.scroll_frame.pack(fill="both", expand=True)
+        self.search_settings_frame = ctk.CTkScrollableFrame(self.tab_search_settings, fg_color="transparent")
+        self.search_settings_frame.pack(fill="both", expand=True)
+        self.output_settings_frame = ctk.CTkScrollableFrame(self.tab_output_settings, fg_color="transparent")
+        self.output_settings_frame.pack(fill="both", expand=True)
 
         self.lbl_exec_mode = ctk.CTkLabel(self.scroll_frame, text="Execution Mode:", anchor="w")
         self.lbl_exec_mode.pack(pady=(5, 0), padx=10, fill="x")
@@ -473,36 +651,57 @@ class BooruManagerApp(ctk.CTk):
         self.lbl_dest_val = ctk.CTkLabel(self.scroll_frame, text=f"...{os.path.basename(self.dest_path)}", font=ctk.CTkFont(size=11), text_color="gray")
         self.lbl_dest_val.pack(pady=(0, 10), padx=10, fill="x")
 
-        self.lbl_unmatched = ctk.CTkLabel(self.scroll_frame, text="Action for Unmatched Images:", anchor="w")
+        self.lbl_subfolder_warning = ctk.CTkLabel(
+            self.scroll_frame,
+            text="Note: Includes one level of destination-library subfolders as routing choices for the LLM.",
+            anchor="w", justify="left", font=ctk.CTkFont(size=11), text_color="gray", wraplength=260
+        )
+        self.lbl_subfolder_warning.pack(pady=(5, 2), padx=10, fill="x")
+        self.switch_scan_subfolders = ctk.CTkSwitch(self.scroll_frame, text="Scan Immediate Subfolders")
+        self.switch_scan_subfolders.pack(pady=(0, 10), padx=10, anchor="w")
+
+        self.lbl_unmatched = ctk.CTkLabel(self.output_settings_frame, text="Action for Unmatched Images:", anchor="w")
         self.lbl_unmatched.pack(pady=(10, 0), padx=10, fill="x")
-        self.opt_unmatched = ctk.CTkOptionMenu(self.scroll_frame, values=["Leave in Source Directory", "Move to Designated Folder"], command=self.on_unmatched_change)
+        self.opt_unmatched = ctk.CTkOptionMenu(self.output_settings_frame, values=["Leave in Source Directory", "Move to Designated Folder"], command=self.on_unmatched_change)
         self.opt_unmatched.pack(pady=(0, 5), padx=10, fill="x")
 
-        self.btn_select_unmatched = ctk.CTkButton(self.scroll_frame, text="Select Unmatched Folder", command=self.browse_unmatched, fg_color="#636363", hover_color="#525252")
+        self.btn_select_unmatched = ctk.CTkButton(self.output_settings_frame, text="Select Unmatched Folder", command=self.browse_unmatched, fg_color="#636363", hover_color="#525252")
         self.btn_select_unmatched.pack(pady=(0, 2), padx=10, fill="x")
-        self.lbl_unmatched_val = ctk.CTkLabel(self.scroll_frame, text="Default: .../Unmatched", font=ctk.CTkFont(size=11), text_color="gray")
+        self.lbl_unmatched_val = ctk.CTkLabel(self.output_settings_frame, text="Default: .../Unmatched", font=ctk.CTkFont(size=11), text_color="gray")
         self.lbl_unmatched_val.pack(pady=(0, 10), padx=10, fill="x")
 
-        self.lbl_engine = ctk.CTkLabel(self.scroll_frame, text="Reverse Search Engine:", anchor="w")
+        self.lbl_engine = ctk.CTkLabel(self.search_settings_frame, text="Reverse Search Engine:", anchor="w")
         self.lbl_engine.pack(pady=(10, 0), padx=10, fill="x")
-        self.opt_engine = ctk.CTkOptionMenu(self.scroll_frame, values=["IQDB", "SauceNAO", "Local Vision LLM"], command=self.on_engine_change)
+        self.opt_engine = ctk.CTkOptionMenu(self.search_settings_frame, values=["IQDB", "SauceNAO", "Local Vision LLM"], command=self.on_engine_change)
         self.opt_engine.pack(pady=(0, 10), padx=10, fill="x")
 
-        self.lbl_tags = ctk.CTkLabel(self.scroll_frame, text="Target Tag Database:", anchor="w")
+        self.lbl_tags = ctk.CTkLabel(self.search_settings_frame, text="Target Tag Database:", anchor="w")
         self.lbl_tags.pack(pady=(5, 0), padx=10, fill="x")
-        self.opt_tags = ctk.CTkOptionMenu(self.scroll_frame, values=["Auto (Highest Confidence)", "Yande.re", "Danbooru", "Gelbooru", "Konachan", "Zerochan", "Pixiv"])
+        self.opt_tags = ctk.CTkOptionMenu(self.search_settings_frame, values=["Auto (Highest Confidence)", "Yande.re", "Danbooru", "Gelbooru", "Konachan", "Zerochan", "Pixiv"])
         self.opt_tags.pack(pady=(0, 10), padx=10, fill="x")
 
-        self.switch_engine_fallback = ctk.CTkSwitch(self.scroll_frame, text="Enable Search Engine Fallback")
+        self.switch_engine_fallback = ctk.CTkSwitch(self.search_settings_frame, text="Enable Search Engine Fallback")
         self.switch_engine_fallback.pack(pady=(5, 5), padx=10, anchor="w")
         self.switch_engine_fallback.select()
 
-        self.switch_vision_fallback = ctk.CTkSwitch(self.scroll_frame, text="Allow Local Vision LLM as Fallback")
+        self.switch_vision_fallback = ctk.CTkSwitch(self.search_settings_frame, text="Allow Local Vision LLM as Fallback")
         self.switch_vision_fallback.pack(pady=(0, 10), padx=10, anchor="w")
 
+        self.switch_use_embedded_tags = ctk.CTkSwitch(
+            self.search_settings_frame,
+            text="Use Existing Embedded Tags (Skip Search)",
+            command=self.on_use_embedded_tags_toggle
+        )
+        self.switch_use_embedded_tags.pack(pady=(5, 6), padx=10, anchor="w")
+        self.switch_skip_no_embedded = ctk.CTkSwitch(
+            self.search_settings_frame,
+            text="Skip if No Embedded Tags Found",
+            font=ctk.CTkFont(size=11)
+        )
+
         self.btn_toggle_api_panel = ctk.CTkButton(
-            self.scroll_frame, 
-            text="⚙️ Hide API & Credentials Panel", 
+            self.search_settings_frame, 
+            text="⚙️ Show API & Credentials Panel", 
             command=self.toggle_api_panel, 
             fg_color="#495057", 
             hover_color="#343a40",
@@ -510,7 +709,7 @@ class BooruManagerApp(ctk.CTk):
         )
         self.btn_toggle_api_panel.pack(pady=(10, 10), padx=10, fill="x")
 
-        self.api_credentials_container = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+        self.api_credentials_container = ctk.CTkFrame(self.search_settings_frame, fg_color="transparent")
         self.api_credentials_container.pack(pady=(0, 5), padx=0, fill="x")
 
         self.switch_serpapi = ctk.CTkSwitch(self.api_credentials_container, text="Enable SerpApi Google Lens")
@@ -584,31 +783,9 @@ class BooruManagerApp(ctk.CTk):
         self.ent_lm = ctk.CTkEntry(self.api_credentials_container)
         self.ent_lm.insert(0, "http://localhost:1234/v1")
         self.ent_lm.pack(pady=(0, 10), padx=10, fill="x")
+        self.api_credentials_container.pack_forget()
 
-        self.lbl_subfolder_warning = ctk.CTkLabel(
-            self.scroll_frame, 
-            text="Note: Scanning subfolders increases context and will need a more powerful LLM.", 
-            anchor="w", justify="left", font=ctk.CTkFont(size=11), text_color="gray", wraplength=260
-        )
-        self.lbl_subfolder_warning.pack(pady=(5, 2), padx=10, fill="x")
-
-        self.switch_scan_subfolders = ctk.CTkSwitch(self.scroll_frame, text="Scan Immediate Subfolders")
-        self.switch_scan_subfolders.pack(pady=(0, 10), padx=10, anchor="w")
-
-        self.switch_use_embedded_tags = ctk.CTkSwitch(
-            self.scroll_frame, 
-            text="Use Existing Embedded Tags (Skip Search)", 
-            command=self.on_use_embedded_tags_toggle
-        )
-        self.switch_use_embedded_tags.pack(pady=(5, 6), padx=10, anchor="w")
-
-        self.switch_skip_no_embedded = ctk.CTkSwitch(
-            self.scroll_frame, 
-            text="Skip if No Embedded Tags Found", 
-            font=ctk.CTkFont(size=11)
-        )
-
-        self.meta_container = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+        self.meta_container = ctk.CTkFrame(self.output_settings_frame, fg_color="transparent")
         self.meta_container.pack(pady=(5, 10), padx=10, fill="x")
 
         self.switch_embed_metadata = ctk.CTkSwitch(self.meta_container, text="Embed Tags in Image Metadata", command=self.on_embed_metadata_toggle)
@@ -638,6 +815,33 @@ class BooruManagerApp(ctk.CTk):
         self.switch_meta_meta = ctk.CTkSwitch(self.frame_tag_categories, text="Meta", font=ctk.CTkFont(size=11))
         self.switch_meta_meta.pack(pady=(2, 8), padx=15, anchor="w")
         self.switch_meta_meta.deselect()
+
+        for widget, help_text in [
+            (self.opt_exec_mode, "Choose between processing a folder automatically or reviewing one image at a time."),
+            (self.btn_select_source, "Choose the folder or image that will be processed."),
+            (self.btn_select_dest, "Choose the library folder where matched images are organized."),
+            (self.switch_scan_subfolders, "Include one level of subfolders inside the destination library as possible folders for the LLM to route matched images into. Source image scanning is unchanged."),
+            (self.opt_unmatched, "Choose whether images without usable tags stay in the source or move to a separate folder."),
+            (self.btn_select_unmatched, "Choose where unmatched images are moved when that action is selected."),
+            (self.opt_engine, "Choose the reverse image search service. IQDB and SauceNAO find matches; Local Vision LLM describes the image."),
+            (self.opt_tags, "Choose which tag database to query for a reverse-search match. Auto tries databases in confidence order."),
+            (self.switch_engine_fallback, "If the selected reverse search finds no usable tags, try the other reverse search engine."),
+            (self.switch_vision_fallback, "If reverse-search services cannot provide tags, ask the local vision model to generate them."),
+            (self.switch_use_embedded_tags, "Use tags already stored in the image metadata and skip reverse searching."),
+            (self.switch_skip_no_embedded, "When embedded-tag mode is on, skip images that contain no embedded tags."),
+            (self.btn_toggle_api_panel, "Open settings for API services, database credentials, and the local LLM endpoint."),
+            (self.switch_serpapi, "Allow SerpApi Google Lens to provide image-match context. Usage is subject to your SerpApi quota."),
+            (self.switch_gvision, "Allow Google Cloud Vision Web Detection to provide image-match context."),
+            (self.switch_skip_on_web_fail, "Treat the image as unmatched if enabled web-search services return no context."),
+            (self.ent_lm, "OpenAI-compatible base URL for your local model server, such as LM Studio or Ollama."),
+            (self.switch_embed_metadata, "Write the selected tags into the output image's metadata."),
+            (self.switch_meta_artist, "Include artist tags when embedding metadata."),
+            (self.switch_meta_series, "Include series and copyright tags when embedding metadata."),
+            (self.switch_meta_character, "Include character tags when embedding metadata."),
+            (self.switch_meta_general, "Include general descriptive tags when embedding metadata."),
+            (self.switch_meta_meta, "Include meta tags, such as image attributes, when embedding metadata."),
+        ]:
+            self.add_tooltip(widget, help_text)
 
         self.bottom_frame = ctk.CTkFrame(self.sidebar_container, fg_color="transparent")
         self.bottom_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(10, 20))
@@ -783,8 +987,62 @@ class BooruManagerApp(ctk.CTk):
         lbl_match_hdr = ctk.CTkLabel(self.history_header_frame, text="Matched Artwork", font=ctk.CTkFont(size=11, weight="bold"), width=70, anchor="center")
         lbl_match_hdr.pack(side="left", padx=(0, 10))
 
+        self.after(100, self._flush_log_queue)
         self.on_unmatched_change(self.opt_unmatched.get())
         self.load_settings()
+        self.after_idle(self._show_initial_window)
+
+    def add_tooltip(self, widget, text):
+        state = {"after_id": None, "window": None}
+
+        def hide_tooltip(_event=None):
+            if state["after_id"] is not None:
+                try:
+                    self.after_cancel(state["after_id"])
+                except Exception:
+                    pass
+                state["after_id"] = None
+            if state["window"] is not None:
+                try:
+                    state["window"].destroy()
+                except Exception:
+                    pass
+                state["window"] = None
+
+        def show_tooltip():
+            state["after_id"] = None
+            if not widget.winfo_exists():
+                return
+            tip = ctk.CTkToplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            label = ctk.CTkLabel(
+                tip, text=text, justify="left", wraplength=280,
+                corner_radius=6,
+                fg_color=("gray15", "gray90"), text_color=("white", "black")
+            )
+            label.pack(padx=9, pady=6)
+            tip.update_idletasks()
+            x = widget.winfo_rootx() + 12
+            y = widget.winfo_rooty() + widget.winfo_height() + 5
+            screen_w = tip.winfo_screenwidth()
+            screen_h = tip.winfo_screenheight()
+            x = min(x, max(0, screen_w - tip.winfo_width() - 8))
+            y = min(y, max(0, screen_h - tip.winfo_height() - 8))
+            tip.geometry(f"+{x}+{y}")
+            tip.deiconify()
+            state["window"] = tip
+
+        widget.bind("<Enter>", lambda _event: state.update(after_id=self.after(500, show_tooltip)), add="+")
+        widget.bind("<Leave>", hide_tooltip, add="+")
+        widget.bind("<ButtonPress>", hide_tooltip, add="+")
+
+    def _show_initial_window(self):
+        if not self.winfo_exists():
+            return
+        self.update_idletasks()
+        self.deiconify()
 
     # Dynamic API key field helpers with + / - buttons
     def add_serpapi_field(self, val=""):
@@ -1077,14 +1335,27 @@ class BooruManagerApp(ctk.CTk):
             "match_url": match_url
         }
         self.history_items.append(entry)
-        
-        filtered = self.get_filtered_history_items()
-        max_pages = max(1, (len(filtered) + self.history_per_page - 1) // self.history_per_page)
-        self.history_page = max_pages - 1
+        self.after(0, lambda item=entry: self._on_history_item_added(item))
 
-        def _refresh():
+    def _on_history_item_added(self, entry):
+        """Append a new history card without rebuilding cards already on the page."""
+        if not self.winfo_exists():
+            return
+        filtered = self.get_filtered_history_items()
+        item_index = next((i for i, item in enumerate(filtered) if item is entry), None)
+        if item_index is None:
+            return
+
+        item_page = item_index // self.history_per_page
+        if item_page != self.history_page:
+            # A new page has started (or a delayed callback crossed a page boundary).
+            self.history_page = item_page
             self.refresh_history_view()
-        self.after(0, _refresh)
+            return
+
+        if not entry.get("card"):
+            self.render_history_card(entry)
+            self.update_metrics_display()
 
     def render_history_card(self, entry):
         current_path = entry["current_path"]
@@ -1103,7 +1374,7 @@ class BooruManagerApp(ctk.CTk):
         thumb_lbl.bind("<Button-1>", lambda e, p=current_path: self.open_file_external(p))
         try:
             with Image.open(current_path) as pil_img:
-                pil_img = pil_img.resize((70, 70))
+                pil_img.thumbnail((70, 70))
                 ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
                 thumb_lbl.configure(image=ctk_img, text="")
                 thumb_lbl.image = ctk_img
@@ -1121,7 +1392,7 @@ class BooruManagerApp(ctk.CTk):
         match_thumb_lbl.grid(row=0, column=1, rowspan=2, padx=(0, 10), pady=10)
         
         if match_thumb_url:
-            threading.Thread(target=self.load_history_match_thumb_async, args=(match_thumb_url, match_thumb_lbl, match_url), daemon=True).start()
+            self.load_history_match_thumb_async(match_thumb_url, match_thumb_lbl, match_url)
         elif match_url:
             match_thumb_lbl.configure(text="[Artwork]")
 
@@ -1153,24 +1424,66 @@ class BooruManagerApp(ctk.CTk):
     def load_history_match_thumb_async(self, url, lbl_widget, match_url=""):
         if url.startswith("//"): url = "https:" + url
         elif url.startswith("/") and not url.startswith("//"): return
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            if "zerochan" in url: headers['Referer'] = 'https://www.zerochan.net/'
-            elif "gelbooru" in url: headers['Referer'] = 'https://gelbooru.com/'
-            elif "danbooru" in url.lower() or "donmai" in url.lower(): headers['Referer'] = 'https://danbooru.donmai.us/'
-            elif "yande" in url: headers['Referer'] = 'https://yande.re/'
-            elif "pixiv" in url: headers['Referer'] = 'https://www.pixiv.net/'
+        with self.history_thumb_lock:
+            cached = self.history_thumb_cache.get(url)
+            if cached is not None:
+                self.history_thumb_cache.move_to_end(url)
+            elif url in self.history_thumb_inflight:
+                self.history_thumb_waiters.setdefault(url, []).append(lbl_widget)
+                return
+            else:
+                self.history_thumb_inflight.add(url)
+                self.history_thumb_waiters[url] = [lbl_widget]
+                cached = None
 
-            res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code == 200:
-                img_data = BytesIO(res.content)
-                with Image.open(img_data) as pil_img:
-                    pil_img = pil_img.resize((70, 70))
-                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(70, 70))
-                    def _apply():
-                        lbl_widget.configure(image=ctk_img, text="")
-                        lbl_widget.image = ctk_img
-                    self.after(0, _apply)
+        if cached is not None:
+            self._apply_history_thumbnail(lbl_widget, cached)
+            return
+
+        future = self.history_thumb_executor.submit(self._download_history_thumbnail, url)
+
+        def _finished(download):
+            try:
+                thumbnail = download.result()
+            except Exception:
+                thumbnail = None
+            with self.history_thumb_lock:
+                self.history_thumb_inflight.discard(url)
+                labels = self.history_thumb_waiters.pop(url, [])
+                if thumbnail is not None:
+                    self.history_thumb_cache[url] = thumbnail
+                    self.history_thumb_cache.move_to_end(url)
+                    while len(self.history_thumb_cache) > self.history_thumb_cache_limit:
+                        self.history_thumb_cache.popitem(last=False)
+            if thumbnail is not None:
+                try:
+                    self.after(0, lambda: [self._apply_history_thumbnail(label, thumbnail) for label in labels])
+                except Exception:
+                    pass
+
+        future.add_done_callback(_finished)
+
+    def _download_history_thumbnail(self, url):
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        if "zerochan" in url: headers['Referer'] = 'https://www.zerochan.net/'
+        elif "gelbooru" in url: headers['Referer'] = 'https://gelbooru.com/'
+        elif "danbooru" in url.lower() or "donmai" in url.lower(): headers['Referer'] = 'https://danbooru.donmai.us/'
+        elif "yande" in url: headers['Referer'] = 'https://yande.re/'
+        elif "pixiv" in url: headers['Referer'] = 'https://www.pixiv.net/'
+        response = get_http_session().get(url, headers=headers, timeout=5)
+        if response.status_code != 200:
+            return None
+        with Image.open(BytesIO(response.content)) as pil_img:
+            pil_img.thumbnail((70, 70))
+            return pil_img.copy()
+
+    def _apply_history_thumbnail(self, label, pil_image):
+        try:
+            if not label.winfo_exists():
+                return
+            ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(70, 70))
+            label.configure(image=ctk_image, text="")
+            label.image = ctk_image
         except Exception:
             pass
 
@@ -1212,6 +1525,7 @@ class BooruManagerApp(ctk.CTk):
     def clear_app_cache(self):
         if messagebox.askyesno("Confirm Clear Cache", "Are you sure you want to clear the hash cache, API counters, console logs, and history?\n\nYour folders, toggles, and API keys will be preserved."):
             tracker.hash_cache.clear()
+            self.result_cache.clear()
             tracker.files_moved = 0
             tracker.matched_files_moved = 0
             tracker.unmatched_files_moved = 0
@@ -1303,7 +1617,10 @@ class BooruManagerApp(ctk.CTk):
                 self.unmatched_path = config["unmatched_folder"]
                 if self.unmatched_path: self.lbl_unmatched_val.configure(text=f"...{os.path.basename(self.unmatched_path)}")
             
-            if "engine" in config: self.opt_engine.set(config["engine"])
+            if "engine" in config:
+                engine_value = "IQDB" if config["engine"] == "Self-hosted IQDB" else config["engine"]
+                if engine_value in ["IQDB", "SauceNAO", "Local Vision LLM"]:
+                    self.opt_engine.set(engine_value)
             if "tags" in config: self.opt_tags.set(config["tags"])
             
             if config.get("fallback", 1): self.switch_engine_fallback.select() 
@@ -1428,6 +1745,11 @@ class BooruManagerApp(ctk.CTk):
 
     def on_closing(self):
         self.save_settings()
+        self.history_thumb_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.result_cache.close()
+        except Exception:
+            pass
         self.destroy()
 
     def on_exec_mode_change(self, choice):
@@ -1495,20 +1817,36 @@ class BooruManagerApp(ctk.CTk):
             self.log(f"Unmatched destination updated to: {folder}")
 
     def log(self, message, full_only=False):
-        def _log():
-            if not full_only:
-                self.txt_console_simp.insert("end", message + "\n")
-                lc_simp = int(self.txt_console_simp.index('end-1c').split('.')[0])
-                if lc_simp > 1000:
-                    self.txt_console_simp.delete("1.0", "2.0")
-                self.txt_console_simp.see("end")
+        self._log_queue.put((str(message), bool(full_only)))
 
-            self.txt_console_full.insert("end", message + "\n")
-            lc_full = int(self.txt_console_full.index('end-1c').split('.')[0])
-            if lc_full > 1000:
-                self.txt_console_full.delete("1.0", "2.0")
-            self.txt_console_full.see("end")
-        self.after(0, _log)
+    def _flush_log_queue(self):
+        if not self.winfo_exists():
+            return
+
+        simplified_lines = []
+        full_lines = []
+        while len(full_lines) < 100:
+            try:
+                message, full_only = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            full_lines.append(message)
+            if not full_only:
+                simplified_lines.append(message)
+
+        def append_batch(widget, lines):
+            if not lines:
+                return
+            widget.insert("end", "\n".join(lines) + "\n")
+            line_count = int(widget.index("end-1c").split(".")[0])
+            max_lines = 250
+            if line_count > max_lines:
+                widget.delete("1.0", f"{line_count - max_lines}.0")
+            widget.see("end")
+
+        append_batch(self.txt_console_simp, simplified_lines)
+        append_batch(self.txt_console_full, full_lines)
+        self.after(200, self._flush_log_queue)
 
     def load_local_thumbnail(self, file_path):
         try:
@@ -1535,7 +1873,7 @@ class BooruManagerApp(ctk.CTk):
             elif "yande" in url: headers['Referer'] = 'https://yande.re/'
             elif "pixiv" in url: headers['Referer'] = 'https://www.pixiv.net/'
             
-            response = requests.get(url, headers=headers, timeout=5)
+            response = get_http_session().get(url, headers=headers, timeout=5)
             if response.status_code == 200:
                 img_data = BytesIO(response.content)
                 with Image.open(img_data) as pil_img:
@@ -1603,7 +1941,7 @@ class BooruManagerApp(ctk.CTk):
         for attempt in range(1, retries + 1):
             if self.skip_requested or self.stop_requested: return None
             try:
-                res = requests.get(url, headers=headers, auth=auth, timeout=timeout)
+                res = get_http_session().get(url, headers=headers, auth=auth, timeout=timeout)
                 if res.status_code != 200:
                     self.log(f"  [API Error] HTTP {res.status_code} for {url.split('?')[0]} ({res.reason})", full_only=False)
                 return res
@@ -1631,7 +1969,7 @@ class BooruManagerApp(ctk.CTk):
 
         try:
             with open(file_path, 'rb') as f:
-                res = requests.post("https://iqdb.org/", files={'file': f}, timeout=15)
+                res = get_http_session().post("https://iqdb.org/", files={'file': f}, timeout=15)
                 
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
@@ -1725,7 +2063,7 @@ class BooruManagerApp(ctk.CTk):
             try:
                 params = {'output_type': 2, 'numres': 5, 'hide': 0, 'api_key': api_key.strip()}
                 with open(file_path, 'rb') as f:
-                    res = requests.post("https://saucenao.com/search.php", params=params, files={'file': f}, timeout=15)
+                    res = get_http_session().post("https://saucenao.com/search.php", params=params, files={'file': f}, timeout=15)
                     
                 if res.status_code == 200:
                     results = res.json().get('results', [])
@@ -1806,11 +2144,8 @@ class BooruManagerApp(ctk.CTk):
                 self.log("  [Web Search] Enabled web search API(s) returned no results or failed. Skipping local vision tagging.", full_only=False)
                 return []
 
-            with open(file_path, "rb") as image_file:
-                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            ext = os.path.splitext(file_path)[1].lower()
-            mime_type = "image/png" if ext == ".png" else "image/jpeg"
+            encoded_image = encode_vision_image(file_path)
+            mime_type = "image/jpeg"
 
             context_instruction = ""
             if web_context:
@@ -1910,12 +2245,21 @@ class BooruManagerApp(ctk.CTk):
             confidence_order.remove(target_key)
             confidence_order.insert(0, target_key)
 
+        available_sources = [source for source in confidence_order if booru_ids.get(source)]
+        self.log(
+            f"  [Tag Lookup Plan] Selected database: {primary_choice}; "
+            f"databases present in this match: {', '.join(available_sources) if available_sources else 'none'}; "
+            f"lookup order: {', '.join(available_sources) if available_sources else 'none'}",
+            full_only=True
+        )
+
         for source in confidence_order:
             if self.stop_requested or self.skip_requested: break
             ident = booru_ids.get(source)
             if not ident: continue
             
             db_display_name = {"danbooru": "Danbooru", "yandere": "Yande.re", "gelbooru": "Gelbooru", "konachan": "Konachan", "zerochan": "Zerochan", "pixiv": "Pixiv"}.get(source, source.capitalize())
+            self.log(f"  [Tag Lookup] Trying {db_display_name} post ID {ident}.", full_only=True)
 
             try:
                 if source == 'danbooru':
@@ -2057,6 +2401,9 @@ class BooruManagerApp(ctk.CTk):
             except Exception as e:
                 if not self.stop_requested:
                     self.log(f"  [{db_display_name} Error] {e}", full_only=False)
+                    self.log(f"  [Tag Lookup Error] {db_display_name} ID {ident}: {e}", full_only=True)
+            if not tag_data['combined']:
+                self.log(f"  [Tag Lookup Result] {db_display_name} ID {ident} did not provide usable tags.", full_only=True)
 
         if not tag_data['matched_url'] and match_meta and match_meta.get('fallback_url'):
             tag_data['matched_url'] = match_meta.get('fallback_url')
@@ -2140,6 +2487,48 @@ class BooruManagerApp(ctk.CTk):
                 model_id = "local-model"
 
             total_files = len(image_files)
+            os.makedirs(self.dest_path, exist_ok=True)
+            scan_subfolders = bool(self.switch_scan_subfolders.get() == 1)
+            available_folders = []
+            try:
+                with os.scandir(self.dest_path) as entries:
+                    for entry in entries:
+                        if not entry.is_dir() or entry.name in ("Unmatched", "Unsorted") or entry.name.startswith("."):
+                            continue
+                        available_folders.append(entry.name)
+                        if scan_subfolders:
+                            try:
+                                with os.scandir(entry.path) as children:
+                                    available_folders.extend(
+                                        f"{entry.name}/{child.name}"
+                                        for child in children
+                                        if child.is_dir() and not child.name.startswith(".")
+                                    )
+                            except OSError:
+                                pass
+            except OSError as folder_error:
+                self.log(f"Warning: Could not scan destination folders: {folder_error}")
+
+            cache_settings = {
+                "version": 3,
+                "engine": engine_choice,
+                "tag_choice": tag_choice,
+                "engine_fallback": allow_engine_fallback,
+                "vision_fallback": allow_vision_fallback,
+                "skip_on_web_fail": bool(self.switch_skip_on_web_fail.get()),
+                "embedded": use_embedded,
+                "skip_no_embedded": skip_no_embedded,
+                "serpapi_enabled": bool(self.switch_serpapi.get()),
+                "serpapi_keys_hash": hashlib.sha256("\n".join(ent.get().strip() for _, ent in self.serpapi_entries).encode("utf-8")).hexdigest(),
+                "gvision_enabled": bool(self.switch_gvision.get()),
+                "gvision_keys_hash": hashlib.sha256("\n".join(ent.get().strip() for _, ent in self.gvision_entries).encode("utf-8")).hexdigest(),
+                "saucenao_keys_hash": hashlib.sha256("\n".join(saucenao_keys).encode("utf-8")).hexdigest(),
+                "model": model_id,
+                "llm_url": lm_url,
+                "destination": os.path.normcase(os.path.abspath(self.dest_path)),
+                "folders": sorted(available_folders),
+            }
+            cache_signature = hashlib.sha256(json.dumps(cache_settings, sort_keys=True).encode("utf-8")).hexdigest()
             self.log(f"Starting sequential execution of {total_files} item(s) in [{exec_mode}]...")
 
             for idx, file_path in enumerate(image_files, 1):
@@ -2152,12 +2541,12 @@ class BooruManagerApp(ctk.CTk):
                 filename = os.path.basename(file_path)
                 self.log(f"Scanning file: {filename}")
                 
-                with open(file_path, 'rb') as f:
-                    file_hash = hashlib.md5(f.read()).hexdigest()
-                
-                if file_hash in tracker.hash_cache:
-                    self.log("  [MD5 Cache Hit] Bypassing APIs, using cached resolution.")
-                    cached_data = tracker.hash_cache[file_hash]
+                file_hash = stream_file_md5(file_path)
+                cached_data = self.result_cache.get(file_hash, cache_signature)
+                cached_negative = bool(cached_data and cached_data.get("status") == "miss")
+
+                if cached_data and cached_data.get("status") == "resolved":
+                    self.log("  [Persistent Cache Hit] Reusing saved tags and folder; bypassing searches and LLM calls.")
                     target_folder = cached_data['folder']
                     tag_dict = cached_data.get('tag_dict', {'combined': cached_data.get('tags', '')})
                     cached_thumb = cached_data.get('thumb', '')
@@ -2212,9 +2601,20 @@ class BooruManagerApp(ctk.CTk):
 
                 if not chosen_match and not self.stop_requested:
                     primary_engine = engine_choice
+                    planned_engines = [primary_engine]
+                    if primary_engine in ("IQDB", "SauceNAO") and allow_engine_fallback:
+                        planned_engines.append("SauceNAO" if primary_engine == "IQDB" else "IQDB")
+                    if primary_engine != "Local Vision LLM" and allow_vision_fallback:
+                        planned_engines.append("Local Vision LLM")
+                    active_tag_database = "not used by Local Vision LLM" if primary_engine == "Local Vision LLM" else tag_choice
+                    self.log(
+                        f"  [Search Plan] Primary engine: {primary_engine}; target tag database: {active_tag_database}; "
+                        f"fallback order: {', '.join(planned_engines[1:]) if len(planned_engines) > 1 else 'disabled'}.",
+                        full_only=True
+                    )
                     fallback_sequence = []
                     
-                    if "IQDB" in primary_engine:
+                    if primary_engine == "IQDB":
                         fallback_sequence = [
                             ('IQDB', lambda fp: self.search_iqdb_engine(fp, is_fallback=False)),
                             ('SauceNAO', lambda fp: self.search_saucenao_engine(fp, saucenao_keys, is_fallback=True)) if allow_engine_fallback else None,
@@ -2231,12 +2631,22 @@ class BooruManagerApp(ctk.CTk):
                             ('Local Vision LLM', lambda fp: self.search_local_vision_engine(fp, client, model_id))
                         ]
 
+                    if cached_negative:
+                        self.log("  [Persistent Cache Hit] Recent no-match result; skipping repeated searches.")
+                        fallback_sequence = []
+
                     for step_info in fallback_sequence:
                         if not step_info or self.stop_requested or self.skip_requested: continue
                         eng_label, search_func = step_info
+                        role = "primary" if eng_label == primary_engine else "fallback"
+                        self.log(f"  [Search Attempt] {eng_label} ({role}) for {filename}.", full_only=True)
                         
                         matches = search_func(file_path)
-                        if not matches: continue
+                        if not matches:
+                            self.log(f"  [Search Result] {eng_label} returned no match candidates.", full_only=True)
+                            continue
+
+                        self.log(f"  [Search Result] {eng_label} returned {len(matches)} candidate(s).", full_only=True)
                         
                         candidate_match = matches[0]
                         cand_thumb = candidate_match.get('thumb', '')
@@ -2310,6 +2720,8 @@ class BooruManagerApp(ctk.CTk):
                     self.log("  [Unsupported Source] All engines exhausted without booru tag support. Treating as unmatched/skipped for tagging, but recording match history.")
 
                 if is_unmatched:
+                    if not cached_negative and not self.stop_requested and not self.skip_requested:
+                        self.result_cache.put(file_hash, cache_signature, "miss", {})
                     action = self.opt_unmatched.get()
                     if "Leave" in action:
                         self.log(f"  [Unmatched] Leaving {filename} in source directory.\n")
@@ -2343,26 +2755,11 @@ class BooruManagerApp(ctk.CTk):
                     if len(tag_list) > 50:
                         formatted_tags = " ".join(tag_list[:50])
 
-                available_folders = []
-                if not os.path.exists(self.dest_path): os.makedirs(self.dest_path)
-                
-                scan_subfolders = bool(self.switch_scan_subfolders.get() == 1)
-
-                for item in os.listdir(self.dest_path):
-                    full_item_path = os.path.join(self.dest_path, item)
-                    if os.path.isdir(full_item_path) and item not in ["Unmatched", "Unsorted"] and not item.startswith("."):
-                        available_folders.append(item)
-                        if scan_subfolders:
-                            try:
-                                for subitem in os.listdir(full_item_path):
-                                    full_subitem_path = os.path.join(full_item_path, subitem)
-                                    if os.path.isdir(full_subitem_path) and not subitem.startswith("."):
-                                        available_folders.append(f"{item}/{subitem}")
-                            except Exception:
-                                pass
-
-                target_folder = "Unsorted"
-                if available_folders and formatted_tags and not self.stop_requested:
+                target_folder = exact_identity_folder(tag_dict, available_folders) or "Unsorted"
+                fast_routed = target_folder != "Unsorted"
+                if fast_routed:
+                    self.log(f"  [Folder Router] Exact identity-tag match routed to {target_folder}; skipped LLM folder call.")
+                if not fast_routed and available_folders and formatted_tags and not self.stop_requested:
                     try:
                         system_p = (
                             "You are a strict file router. Analyze the tags and select the single best matching "
@@ -2399,6 +2796,34 @@ class BooruManagerApp(ctk.CTk):
                     self.file_in_progress = False
                     break
 
+                if target_folder == "Unsorted":
+                    self.log(f"  [Folder Router] No matching destination folder found for {filename}; applying the unmatched-image action.")
+                    if not cached_negative and not self.stop_requested and not self.skip_requested:
+                        self.result_cache.put(file_hash, cache_signature, "miss", {})
+
+                    action = self.opt_unmatched.get()
+                    if "Leave" in action:
+                        self.log(f"  [Unmatched] No matching folder; leaving {filename} in the source directory.\n")
+                    else:
+                        dest_unmatched = self.unmatched_path
+                        if not dest_unmatched or not os.path.exists(dest_unmatched):
+                            dest_unmatched = os.path.join(self.dest_path, "Unmatched") if self.dest_path else os.path.abspath("./Unmatched")
+                        os.makedirs(dest_unmatched, exist_ok=True)
+                        target_file_path = os.path.join(dest_unmatched, filename)
+                        shutil.move(file_path, target_file_path)
+                        self.log(f"  -> Moved into Unmatched Folder: {target_file_path}\n")
+                        tracker.files_moved += 1
+                        tracker.unmatched_files_moved += 1
+                        self.update_metrics_display()
+                        self.add_history_item(file_path, target_file_path, filename, is_unmatched=True, match_thumb_url=match_thumb, match_url=matched_url)
+
+                    self.file_in_progress = False
+                    self.btn_skip.configure(state="normal", fg_color="#e67700")
+                    if "Single" in exec_mode:
+                        break
+                    else:
+                        continue
+
                 final_dest_path = os.path.join(self.dest_path, target_folder)
                 os.makedirs(final_dest_path, exist_ok=True)
                 target_file_path = os.path.join(final_dest_path, filename)
@@ -2406,8 +2831,15 @@ class BooruManagerApp(ctk.CTk):
                 
                 self.embed_metadata(target_file_path, tag_dict)
 
-                if formatted_tags and target_folder != "Unsorted":
-                    tracker.hash_cache[file_hash] = {'tags': formatted_tags, 'folder': target_folder, 'tag_dict': tag_dict, 'thumb': match_thumb, 'matched_url': matched_url}
+                if formatted_tags:
+                    cache_payload = {
+                        "tags": formatted_tags,
+                        "folder": target_folder,
+                        "tag_dict": tag_dict,
+                        "thumb": match_thumb,
+                        "matched_url": matched_url,
+                    }
+                    self.result_cache.put(file_hash, cache_signature, "resolved", cache_payload)
                 
                 tracker.files_moved += 1
                 tracker.matched_files_moved += 1
